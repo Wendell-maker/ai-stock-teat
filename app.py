@@ -1,7 +1,3 @@
-這是一個專為量化交易與手機端優化設計的 **Streamlit Ultimate Dashboard (終極戰情室)**。
-
-這個程式碼整合了 `yfinance` 進行實時數據抓取、`pandas_ta` (或手寫邏輯) 計算技術指標，並透過 Google Gemini API 進行 AI 策略分析。所有介面均已繁體中文化，並採用 Mobile-First 的響應式設計。
-
 ### 檔案 1: `app.py`
 
 ```python
