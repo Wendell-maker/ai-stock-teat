@@ -1,276 +1,318 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import google.generativeai as genai
-from datetime import datetime, timedelta
-import pytz
+from datetime import datetime
+import time
 from streamlit_autorefresh import st_autorefresh
 
-# --- 應用程式設定 (Page Config) ---
+# --- 頁面設定與 CSS 優化 ---
 st.set_page_config(
     page_title="終極 AI 選擇權戰情室",
-    page_icon="💹",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# --- 自定義 CSS 樣式 (UI/UX 優化) ---
-# 優化手機端顯示、字體大小與儀表板間距
+# 自定義 CSS 以優化手機端顯示與儀表板佈局
 st.markdown("""
     <style>
-    .stMetric {
-        background-color: #1E1E1E;
-        padding: 15px;
-        border-radius: 10px;
-        border: 1px solid #333;
-    }
-    .big-font {
-        font-size: 24px !important;
+    /* 調整 Metric 樣式 */
+    div[data-testid="stMetricValue"] {
+        font-size: 1.5rem;
         font-weight: bold;
     }
-    .stAlert {
-        font-size: 1.2rem;
+    /* 針對手機端的優化 */
+    @media (max-width: 640px) {
+        div[data-testid="stMetricValue"] {
+            font-size: 1.2rem;
+        }
     }
-    /* 調整手機版面間距 */
-    div[data-testid="column"] {
-        width: 100% !important;
-        flex: 1 1 auto;
-        min-width: 150px;
+    /* 警告區塊樣式 */
+    .stAlert {
+        font-weight: bold;
     }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 全域變數與 Session State 初始化 ---
-# 用於存儲上一分鐘的數據以計算 Delta
-if 'last_run_data' not in st.session_state:
-    st.session_state['last_run_data'] = None
+# --- 數據抓取模組 ---
 
-# 設定自動刷新 (每 60 秒刷新一次，模擬戰情室即時感)
-count = st_autorefresh(interval=60 * 1000, key="datarefresh")
-
-# --- 數據抓取模組 (Data Fetching Module) ---
-
-def fetch_market_data():
+def calculate_rsi(data: pd.Series, window: int = 14) -> float:
     """
-    抓取台股現貨、期貨(模擬)、VIX 與 NVDA 數據。
-    
+    計算相對強弱指標 (RSI)。
+
+    Args:
+        data (pd.Series): 收盤價序列。
+        window (int): 計算週期，預設 14。
+
     Returns:
-        dict: 包含各項市場數據的字典，若抓取失敗則回傳預設值。
+        float: 最新一筆 RSI 數值。
+    """
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.iloc[-1]
+
+def get_market_data():
+    """
+    從 yfinance 抓取即時市場數據並計算技術指標。
+    
+    包含：台股現貨 (^TWII), 台指期 (TXF=F), VIX (^VIX), NVDA。
+    注意：yfinance 台指期可能有延遲，此處為演示邏輯。
+
+    Returns:
+        dict: 包含各項市場數據與技術指標的字典。
     """
     try:
-        # 定義代碼 (Yahoo Finance)
-        # ^TWII: 台灣加權指數 (現貨)
-        # TXF=F: 台指期 (注意: 免費源通常有延遲，此處作為演示)
-        # ^VIX: 恐慌指數
-        # NVDA: 輝達 (作為美股/AI連動指標)
-        tickers = ['^TWII', 'TXF=F', '^VIX', 'NVDA']
+        # 定義代碼
+        tickers = {
+            "spot": "^TWII",   # 台灣加權指數
+            "future": "TXF=F", # 台指期 (需注意 YF 數據延遲或代碼變更)
+            "vix": "^VIX",     # 恐慌指數
+            "nvda": "NVDA"     # AI 風向球
+        }
         
-        # 抓取最近 50 天數據以計算技術指標 (RSI, MA)
-        data = yf.download(tickers, period="3mo", interval="1d", progress=False)
+        # 批量下載數據 (取最近 30 天以計算 MA 和 RSI)
+        data = yf.download(list(tickers.values()), period="1mo", interval="1d", progress=False)
         
         # 處理 MultiIndex Column 問題
         if isinstance(data.columns, pd.MultiIndex):
-            df = data['Close'].copy()
+            df_close = data['Close']
         else:
-            df = data.copy()
+            df_close = data
             
-        # 確保數據是最新的
-        current_data = df.iloc[-1]
-        history_data = df # 用於計算技術指標
+        # 提取最新價格與前一日價格 (用於計算漲跌)
+        latest = df_close.iloc[-1]
+        prev = df_close.iloc[-2]
+        
+        # 計算技術指標 (針對現貨 ^TWII)
+        twii_series = df_close[tickers["spot"]].dropna()
+        rsi_val = calculate_rsi(twii_series, 14)
+        ma5_val = twii_series.rolling(window=5).mean().iloc[-1]
+        
+        spot_price = latest[tickers["spot"]]
+        future_price = latest[tickers["future"]]
+        
+        # 處理 NaN 狀況 (若期貨無數據，暫以現貨代替演示)
+        if pd.isna(future_price):
+            future_price = spot_price
+            
+        spread = future_price - spot_price # 價差
         
         return {
-            "twii_price": current_data['^TWII'],
-            "twii_hist": history_data['^TWII'],
-            "tx_price": current_data['TXF=F'],
-            "vix_price": current_data['^VIX'],
-            "nvda_price": current_data['NVDA'],
-            "nvda_prev": df.iloc[-2]['NVDA'] # 用於計算 NVDA 漲跌
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "spot": spot_price,
+            "future": future_price,
+            "spread": spread,
+            "vix": latest[tickers["vix"]],
+            "nvda_price": latest[tickers["nvda"]],
+            "nvda_pct": ((latest[tickers["nvda"]] - prev[tickers["nvda"]]) / prev[tickers["nvda"]]) * 100,
+            "rsi": rsi_val,
+            "ma5": ma5_val,
+            "is_above_ma5": spot_price > ma5_val
         }
     except Exception as e:
-        st.error(f"數據抓取錯誤: {e}")
+        st.error(f"數據抓取失敗: {e}")
         return None
 
-# --- 技術分析模組 (Technical Analysis Module) ---
+# --- AI 策略大腦模組 ---
 
-def calculate_technical_indicators(series_data):
+def get_ai_strategy(market_data: dict, delta_data: dict, api_key: str):
     """
-    計算 RSI (14) 與 MA5。
-    
+    呼叫 Google Gemini API 進行盤勢分析與策略建議。
+
     Args:
-        series_data (pd.Series): 歷史價格序列。
-    
-    Returns:
-        tuple: (rsi_value, ma5_value)
-    """
-    # 計算 MA5
-    ma5 = series_data.rolling(window=5).mean().iloc[-1]
-    
-    # 計算 RSI 14
-    delta = series_data.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs)).iloc[-1]
-    
-    return rsi, ma5
+        market_data (dict): 當前市場數據。
+        delta_data (dict): 與上一分鐘的變化量。
+        api_key (str): Google GenAI API Key。
 
-# --- AI 策略大腦模組 (AI Strategy Module) ---
-
-def get_ai_strategy(market_context):
-    """
-    呼叫 Google Gemini API 進行策略分析。
-    
-    Args:
-        market_context (dict): 包含目前市場狀態的數據字典。
-        
     Returns:
-        str: AI 的操作建議。
+        str: AI 的分析建議。
     """
-    # 嘗試從 Streamlit Secrets 獲取 API Key，否則顯示警告
-    api_key = st.secrets.get("GOOGLE_API_KEY")
     if not api_key:
-        return "⚠️ 請於 secrets.toml 設定 GOOGLE_API_KEY 以啟用 AI 分析"
-
-    genai.configure(api_key=api_key)
+        return "請輸入 API Key 以啟動 AI 戰情室。"
     
-    # 設定模型
-    model = genai.GenerativeModel('gemini-2.0-flash') # 使用較快模型以確保即時性
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-1.5-flash') # 使用輕量快速模型
 
     # 建構 Prompt
     prompt = f"""
-    你是一位嚴守紀律的選擇權操盤手。
+    【角色設定】
+    你是一位嚴守紀律的選擇權操盤手。核心心法：「順勢 (看價差)、防守 (看 MA5)、避險 (看 VIX)」。不做預測，只做對策。
     
-    【交易哲學】
-    核心心法：「順勢 (看價差)、防守 (看 MA5)、避險 (看 VIX)」。不做預測，只做對策。
+    【當前市場數據】
+    - 時間: {market_data['timestamp']}
+    - 台指期: {market_data['future']:.0f}
+    - 現貨價差: {market_data['spread']:.2f} (變化: {delta_data.get('spread_delta', 0):.2f})
+    - VIX 指數: {market_data['vix']:.2f} (變化: {delta_data.get('vix_delta', 0):.2f})
+    - RSI (14): {market_data['rsi']:.1f}
+    - 現貨價格 vs MA5: {'站上' if market_data['is_above_ma5'] else '跌破'} (現貨: {market_data['spot']:.0f}, MA5: {market_data['ma5']:.0f})
+    - NVDA 漲跌幅: {market_data['nvda_pct']:.2f}%
 
-    【判讀系統】
-    1. 價差 (Spread = 期貨 - 現貨)：正價差 (>+50) 為多頭保護傘；轉負或大幅收斂則撤退。
+    【判讀系統規則】
+    1. 價差：正價差 (>+50) 為多頭保護傘；轉負或大幅收斂則撤退。
     2. VIX：> 20 (恐慌/權利金貴 -> 買方宜短進短出)；< 15 (安逸/權利金便宜 -> 適合波段)。
     3. RSI+MA：RSI > 80 絕對過熱禁止追價；跌破 MA5 多單減碼。
 
-    【當前市場數據】
-    - 台指期 (TX): {market_context['tx']:.0f}
-    - 加權指數 (TWII): {market_context['twii']:.0f}
-    - 價差 (Spread): {market_context['spread']:.0f} (前值變化: {market_context['spread_delta']:.0f})
-    - VIX 恐慌指數: {market_context['vix']:.2f}
-    - NVDA 漲跌幅: {market_context['nvda_pct']:.2f}%
-    - RSI (14): {market_context['rsi']:.1f}
-    - MA5 位置: {market_context['ma5']:.0f}
-    - 收盤價 vs MA5: {"站上" if market_context['twii'] > market_context['ma5'] else "跌破"}
+    【參考判例 (Few-Shot)】
+    - 案例 A (真軋空)：價差 +100 且持續擴大，VIX 平穩。-> 建議：續抱。
+    - 案例 B (假突破)：價格創高但價差收斂且 RSI > 85。-> 建議：獲利了結。
+    - 案例 C (殺盤)：破 MA5，價差轉逆，VIX 暴漲。-> 建議：止損/反手。
 
     【任務】
-    請根據上述數據，給出一句「大字號的操作建議」。
-    風格要求：簡潔有力、直指核心、包含具體方向 (做多/做空/觀望/避險)。
-    
-    輸出範例：
-    "多頭強勢，價差擴大，續抱多單但留意 RSI 過熱。"
-    "跌破 MA5 且 VIX 飆升，立刻止損並反手買進 Put。"
+    請根據上述數據與規則，給出一個「大字號一句話操作建議」(例如：多單續抱、獲利了結、觀望等)，並附帶簡短理由 (50字內)。
     """
     
     try:
         response = model.generate_content(prompt)
-        return response.text.strip()
+        return response.text
     except Exception as e:
-        return f"AI 分析連線失敗: {str(e)}"
+        return f"AI 分析連線錯誤: {e}"
 
-# --- 主程式邏輯 (Main Application Logic) ---
+# --- 主程式邏輯 ---
 
 def main():
-    # 1. 頂部導航列 (Top Bar)
-    col_header_1, col_header_2 = st.columns([3, 1])
-    with col_header_1:
-        st.title("🚀 終極 AI 選擇權戰情室")
-    with col_header_2:
-        tz = pytz.timezone('Asia/Taipei')
-        current_time = datetime.now(tz).strftime('%H:%M:%S')
-        st.caption(f"最後更新: {current_time}")
-        if st.button("🔄 立即刷新"):
+    # Sidebar 設定
+    with st.sidebar:
+        st.header("⚙️ 設定")
+        api_key = st.text_input("Gemini API Key", type="password")
+        refresh_rate = st.slider("刷新頻率 (秒)", 30, 300, 60)
+        st.caption("數據來源: Yahoo Finance (延遲至少 15 分鐘，僅供策略展示)")
+        
+        # 手動重置狀態按鈕
+        if st.button("清除快取狀態"):
+            st.session_state.clear()
             st.rerun()
 
-    # 2. 數據處理
-    raw_data = fetch_market_data()
+    # 自動刷新機制
+    count = st_autorefresh(interval=refresh_rate * 1000, key="data_refresh")
+
+    # 1. 初始化 Session State (記憶體)
+    if 'prev_data' not in st.session_state:
+        st.session_state['prev_data'] = None
+
+    # 2. 獲取數據
+    current_data = get_market_data()
     
-    if raw_data:
-        # 計算技術指標
-        rsi, ma5 = calculate_technical_indicators(raw_data['twii_hist'])
-        
-        # 計算衍生數據
-        spread = raw_data['tx_price'] - raw_data['twii_price']
-        nvda_change = ((raw_data['nvda_price'] - raw_data['nvda_prev']) / raw_data['nvda_prev']) * 100
-        
-        # 計算 Delta (與上一次刷新相比)
-        last_data = st.session_state['last_run_data']
-        spread_delta = 0
-        if last_data:
-            spread_delta = spread - last_data['spread']
-        
-        # 更新 Session State
-        current_state = {
-            'tx': raw_data['tx_price'],
-            'twii': raw_data['twii_price'],
-            'spread': spread,
-            'spread_delta': spread_delta,
-            'vix': raw_data['vix_price'],
-            'nvda_pct': nvda_change,
-            'rsi': rsi,
-            'ma5': ma5
-        }
-        st.session_state['last_run_data'] = current_state
-
-        # 3. AI 信號燈 (Signal Banner)
-        ai_advice = get_ai_strategy(current_state)
-        
-        # 根據建議內容簡單判斷顏色 (僅作視覺輔助)
-        if "止損" in ai_advice or "避險" in ai_advice or "空" in ai_advice:
-            st.error(f"🤖 AI 戰略官：{ai_advice}")
-        elif "多" in ai_advice or "續抱" in ai_advice:
-            st.success(f"🤖 AI 戰略官：{ai_advice}")
+    if current_data:
+        # 計算 Delta (與上一分鐘/上一次刷新對比)
+        delta_data = {}
+        if st.session_state['prev_data']:
+            prev = st.session_state['prev_data']
+            delta_data['spot_delta'] = current_data['spot'] - prev['spot']
+            delta_data['future_delta'] = current_data['future'] - prev['future']
+            delta_data['spread_delta'] = current_data['spread'] - prev['spread']
+            delta_data['vix_delta'] = current_data['vix'] - prev['vix']
+            delta_data['rsi_delta'] = current_data['rsi'] - prev['rsi']
         else:
-            st.info(f"🤖 AI 戰略官：{ai_advice}")
+            # 第一次運行無 Delta
+            delta_data = {k: 0 for k in ['spot_delta', 'future_delta', 'spread_delta', 'vix_delta', 'rsi_delta']}
 
-        # 4. 數據矩陣 (3x2 Grid)
+        # 更新 Session State
+        st.session_state['prev_data'] = current_data
+
+        # --- UI 呈現 ---
+        
+        # Top Bar
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            st.title("🛡️ 終極 AI 選擇權戰情室")
+        with c2:
+            st.write(f"更新: {current_data['timestamp']}")
+            if st.button("🔄 立即刷新"):
+                st.rerun()
+
+        # AI 信號燈區塊
+        if api_key:
+            with st.spinner("AI 正在分析盤勢..."):
+                ai_advice = get_ai_strategy(current_data, delta_data, api_key)
+            
+            # 簡單的情緒分析來決定顏色 (此處僅為簡單關鍵字判斷，可由 AI 直接返回 JSON 優化)
+            if "止損" in ai_advice or "撤退" in ai_advice or "空" in ai_advice:
+                st.error(f"🤖 AI 指令：{ai_advice}")
+            elif "續抱" in ai_advice or "多" in ai_advice:
+                st.success(f"🤖 AI 指令：{ai_advice}")
+            else:
+                st.info(f"🤖 AI 指令：{ai_advice}")
+        else:
+            st.warning("請在左側輸入 Google API Key 以解鎖 AI 策略腦。")
+
         st.markdown("---")
+
+        # 3x2 Grid 數據矩陣
         
         # Row 1: 台指期 | 價差
         row1_col1, row1_col2 = st.columns(2)
         with row1_col1:
-            st.metric("台指期 (TX)", f"{raw_data['tx_price']:.0f}", 
-                      delta=f"{raw_data['tx_price'] - raw_data['twii_price']:.0f} (Spread)")
+            st.metric(
+                label="台指期 (TX)", 
+                value=f"{current_data['future']:.0f}", 
+                delta=f"{delta_data['future_delta']:.0f}"
+            )
         with row1_col2:
-            # 價差特殊樣式
-            spread_label = "現貨價差 (Spread)"
-            spread_val = f"{spread:.0f}"
-            if spread > 50:
-                spread_val = f"🔥 {spread:.0f}" # 過熱/強勢提示
-            st.metric(spread_label, spread_val, delta=f"{spread_delta:.0f} (變動)")
+            spread_val = current_data['spread']
+            spread_color = "normal"
+            if spread_val > 50:
+                spread_color = "off" # Streamlit metric doesn't support direct text color, using delta logic visually
+            
+            st.metric(
+                label="現貨價差 (Spread)", 
+                value=f"{spread_val:.2f}", 
+                delta=f"{delta_data['spread_delta']:.2f}",
+                delta_color="normal" if spread_val < 50 else "inverse" # 逆價差或正價差過大變色
+            )
+            if spread_val > 50:
+                st.caption("🚨 正價差 > 50 (多頭保護)")
+            elif spread_val < 0:
+                st.caption("⚠️ 逆價差 (空方優勢)")
 
         # Row 2: VIX | NVDA
         row2_col1, row2_col2 = st.columns(2)
         with row2_col1:
-            vix_val = raw_data['vix_price']
-            vix_delta_color = "inverse" # VIX 漲是不好的 (通常)
-            st.metric("VIX 恐慌指數", f"{vix_val:.2f}", delta=None, delta_color="off")
+            st.metric(
+                label="VIX 恐慌指數", 
+                value=f"{current_data['vix']:.2f}", 
+                delta=f"{delta_data['vix_delta']:.2f}",
+                delta_color="inverse" # VIX 漲是不好的，反轉顏色
+            )
         with row2_col2:
-            st.metric("NVDA 漲跌幅", f"{nvda_change:.2f}%", 
-                      delta=f"{nvda_change:.2f}%")
+            st.metric(
+                label="NVDA 漲跌幅", 
+                value=f"{current_data['nvda_pct']:.2f}%", 
+                delta=f"{current_data['nvda_pct']:.2f}%"
+            )
 
         # Row 3: RSI | MA5
         row3_col1, row3_col2 = st.columns(2)
         with row3_col1:
-            rsi_text = f"{rsi:.1f}"
-            if rsi > 80: rsi_text += " (過熱 🔴)"
-            if rsi < 20: rsi_text += " (超賣 🟢)"
-            st.metric("RSI (14) 強弱", rsi_text)
+            rsi = current_data['rsi']
+            label_suffix = " (過熱)" if rsi > 80 else " (超賣)" if rsi < 20 else ""
+            st.metric(
+                label=f"RSI (14){label_suffix}", 
+                value=f"{rsi:.1f}", 
+                delta=f"{delta_data['rsi_delta']:.1f}"
+            )
         with row3_col2:
-            # 判斷站上或跌破
-            dist_to_ma = raw_data['twii_price'] - ma5
-            status = "站穩 🟢" if dist_to_ma > 0 else "跌破 🔴"
-            st.metric("MA5 均線", f"{ma5:.0f}", delta=status)
+            spot = current_data['spot']
+            ma5 = current_data['ma5']
+            is_above = current_data['is_above_ma5']
+            st.metric(
+                label="現貨 vs MA5", 
+                value=f"{spot:.0f}", 
+                delta=f"{spot - ma5:.0f} (距離均線)",
+                help=f"MA5 價格: {ma5:.0f}"
+            )
+            if not is_above:
+                st.caption("🔻 收盤跌破 MA5 (防守)")
+            else:
+                st.caption("✅ 站穩 MA5 上方")
 
     else:
-        st.warning("無法獲取市場數據，請檢查網路連線或 API 狀態。")
+        st.error("無法獲取市場數據，請檢查網絡連接或稍後重試。")
 
 if __name__ == "__main__":
     main()
@@ -282,4 +324,3 @@ if __name__ == "__main__":
 # yfinance
 # google-generativeai
 # streamlit-autorefresh
-# pytz
