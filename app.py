@@ -1,237 +1,351 @@
+這是一個專為量化交易與手機端優化設計的 **Streamlit Ultimate Dashboard (終極戰情室)**。
+
+這個程式碼整合了 `yfinance` 進行實時數據抓取、`pandas_ta` (或手寫邏輯) 計算技術指標，並透過 Google Gemini API 進行 AI 策略分析。所有介面均已繁體中文化，並採用 Mobile-First 的響應式設計。
+
+### 檔案 1: `app.py`
+
+```python
 import streamlit as st
 import yfinance as yf
-import requests
-import google.generativeai as genai
-from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
+import google.generativeai as genai
+from datetime import datetime
 import time
+from streamlit_autorefresh import st_autorefresh
 
 # ==========================================
-# 1. 網頁與全域設定
+# 1. 頁面配置與樣式 (Mobile-First UI)
 # ==========================================
-st.set_page_config(page_title="AI 智能操盤戰情室 (Ultimate)", page_icon="🦅", layout="wide")
+st.set_page_config(
+    page_title="終極 AI 選擇權戰情室",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-# 初始化 Session State (動態記憶)
-if 'prev_spread' not in st.session_state:
-    st.session_state.prev_spread = 0
-if 'prev_tx' not in st.session_state:
-    st.session_state.prev_tx = 0
+# 自定義 CSS 優化手機顯示與儀表板風格
+st.markdown("""
+    <style>
+    .main .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+    div[data-testid="stMetric"] {
+        background-color: #1E1E1E;
+        padding: 10px;
+        border-radius: 10px;
+        border: 1px solid #333;
+        text-align: center;
+    }
+    div[data-testid="stMetricLabel"] { font-size: 0.9rem; color: #aaa; }
+    div[data-testid="stMetricValue"] { font-size: 1.4rem; font-weight: bold; }
+    .stAlert { font-weight: bold; }
+    /* 強制格狀佈局在手機上不塌陷 */
+    [data-testid="column"] { min-width: 100px; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# 自動刷新計時器 (每 60 秒)
-count = st_autorefresh(interval=60000, limit=None, key="fcounter")
+# 自動刷新機制 (每 60 秒刷新一次，模擬即時看盤)
+count = st_autorefresh(interval=60 * 1000, key="data_refresh")
 
 # ==========================================
-# 2. 側邊欄：金鑰與設定
+# 2. 初始化 Session State (動態記憶)
 # ==========================================
+if 'history' not in st.session_state:
+    st.session_state.history = {
+        'price': None,
+        'spread': None,
+        'vix': None,
+        'last_update': None
+    }
+
+# Sidebar 設定 API Key
 with st.sidebar:
     st.header("⚙️ 系統設定")
-    gemini_api_key = st.text_input("Gemini API Key", type="password")
-    
-    st.divider()
-    
-    auto_refresh = st.checkbox("啟動全自動監控", value=True)
-    st.caption("含 VIX 恐慌指數與 RSI 技術分析")
-
-# ==========================================
-# 3. 數據抓取與計算引擎
-# ==========================================
-
-# A. 抓台指期 (爬蟲)
-def get_tw_futures():
-    try:
-        url = "https://mis.taifex.com.tw/futures/api/getQuoteList"
-        payload = {"MarketType": "0", "SymbolType": "F", "KindID": "1", "CID": "TXF", "ExpireMonth": ""}
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.post(url, json=payload, headers=headers, timeout=5)
-        data = res.json()
-        if data['QuoteList']:
-            quote = data['QuoteList'][0]
-            price = float(quote.get('DealPrice', 0))
-            return price
-    except:
-        return 0
-
-# B. 抓美股與 VIX (yfinance)
-def get_us_market_data():
-    """一次抓取 NVDA 和 VIX"""
-    try:
-        tickers = yf.Tickers("NVDA ^VIX")
-        
-        # NVDA 處理
-        nvda_hist = tickers.tickers['NVDA'].history(period="1d")
-        if not nvda_hist.empty:
-            nvda_price = nvda_hist['Close'].iloc[-1]
-            nvda_open = nvda_hist['Open'].iloc[0]
-            nvda_chg = ((nvda_price - nvda_open) / nvda_open) * 100
-        else:
-            nvda_price, nvda_chg = 0, 0
-            
-        # VIX 處理
-        vix_hist = tickers.tickers['^VIX'].history(period="1d")
-        if not vix_hist.empty:
-            vix_price = vix_hist['Close'].iloc[-1]
-        else:
-            vix_price = 0
-            
-        return nvda_price, nvda_chg, vix_price
-    except:
-        return 0, 0, 0
-
-# C. 抓現貨並計算技術指標 (RSI, MA)
-def get_technical_analysis():
-    """
-    抓取加權指數 (^TWII) 的 K 線來計算技術指標
-    回傳: 現貨價格, RSI數值, MA5價格
-    """
-    try:
-        # 抓取最近 30 天資料 (計算 RSI 用)
-        tw = yf.Ticker("^TWII")
-        hist = tw.history(period="1mo") 
-        
-        if hist.empty:
-            return 0, 50, 0 # 預設值
-            
-        current_price = hist['Close'].iloc[-1]
-        
-        # 1. 計算 MA5 (五日均線)
-        ma5 = hist['Close'].rolling(window=5).mean().iloc[-1]
-        
-        # 2. 計算 RSI (14)
-        delta = hist['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        current_rsi = rsi.iloc[-1]
-        
-        return current_price, current_rsi, ma5
-    except:
-        return 0, 50, 0
-
-# ==========================================
-# 4. AI 策略大腦 (含技術指標與VIX)
-# ==========================================
-STRATEGY_CONTEXT = """
-【角色設定】
-你是一位精通「技術分析」與「籌碼解讀」的頂尖操盤手。
-你的決策必須綜合考量：價差籌碼、技術位階 (RSI/MA)、以及市場恐慌度 (VIX)。
-
-【多維度判斷邏輯】
-1. **價差結構 (Spread)**:
-   - 價差 > +50 且 動能(Delta) > 0：多頭強攻。
-   - 價差 > +50 但 動能 < -20：買盤力竭，多單警戒。
-
-2. **技術位階 (Technical Filter)** - *這是精準度的關鍵*:
-   - **RSI 指標**: 若 RSI > 80，視為「嚴重過熱」。即使價差是紅的，也**絕對禁止**追價，建議等待拉回或平倉。
-   - **MA5 均線**: 價格在 MA5 之上為強勢；跌破 MA5 為轉弱訊號 (出場點)。
-
-3. **VIX 恐慌指數 (Volatility)**:
-   - **VIX > 20**: 市場恐慌，權利金極貴。策略：不留倉，快進快出。
-   - **VIX < 13**: 市場安逸，權利金便宜。策略：適合波段持有 Buy Call。
-   - **VIX 暴漲**: 若指數跌且 VIX 飆升，代表恐慌性殺盤，Put 會噴出。
-
-4. **美股連動**:
-   - NVDA 漲 > 2%：AI 族群強勢助漲。
-
-【使用者部位】
-- 持有：Buy Call 28000。
-- 任務：利用上述指標，幫我判斷現在該「貪婪」還是該「恐懼」。
-"""
-
-def get_gemini_analysis(api_key, tx, spread, delta, nvda_chg, vix, rsi, ma5, tw_spot):
+    api_key = st.text_input("輸入 Gemini API Key", type="password")
+    st.caption("請至 Google AI Studio 獲取 API Key")
     if not api_key:
-        return "⚠️ 請輸入 API Key"
+        st.warning("請輸入 API Key 以啟動 AI 大腦")
+
+# ==========================================
+# 3. 後端引擎：數據抓取與指標計算
+# ==========================================
+@st.cache_data(ttl=60)
+def fetch_market_data():
+    """
+    抓取台股現貨、期貨(模擬)、VIX、NVDA 數據
+    注意：Yahoo Finance 的台指期 (TXF=F) 有延遲，僅供參考趨勢。
+    """
+    try:
+        # 定義代碼
+        tickers = {
+            'spot': '^TWII',   # 台灣加權指數
+            'future': 'TXF=F', # 台指期 (延遲)
+            'vix': '^VIX',     # CBOE VIX
+            'nvda': 'NVDA'     # NVDA
+        }
+        
+        data = yf.download(list(tickers.values()), period="1mo", interval="1d", progress=False)['Close']
+        
+        # 整理數據
+        df = pd.DataFrame()
+        # yfinance 數據結構可能為 MultiIndex，需做處理
+        for key, code in tickers.items():
+            if code in data.columns:
+                df[key] = data[code]
+            else:
+                # 處理單一 ticker 回傳結構不同的情況
+                temp = yf.Ticker(code).history(period="1mo")['Close']
+                df[key] = temp
+
+        # 確保數據按日期排序
+        df = df.sort_index()
+        
+        return df
+    except Exception as e:
+        st.error(f"數據抓取失敗: {e}")
+        return pd.DataFrame()
+
+def calculate_technicals(df):
+    """計算 RSI, MA5, 價差"""
+    if df.empty:
+        return None
+
+    # 1. 價差 (期貨 - 現貨)
+    # 填充 NaN 以防數據對不齊
+    df = df.ffill()
+    current_spot = df['spot'].iloc[-1]
+    current_future = df['future'].iloc[-1]
+    spread = current_future - current_spot
+    
+    # 2. MA5 (Spot)
+    ma5 = df['spot'].rolling(window=5).mean().iloc[-1]
+    
+    # 3. RSI (14) using native pandas
+    delta = df['spot'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs)).iloc[-1]
+    
+    # 4. NVDA 漲跌幅
+    nvda_change = ((df['nvda'].iloc[-1] - df['nvda'].iloc[-2]) / df['nvda'].iloc[-2]) * 100
+    
+    return {
+        'spot_price': current_spot,
+        'future_price': current_future,
+        'spread': spread,
+        'vix': df['vix'].iloc[-1],
+        'ma5': ma5,
+        'rsi': rsi,
+        'nvda_pct': nvda_change,
+        'ma5_diff': current_spot - ma5 # 正值代表站上，負值代表跌破
+    }
+
+# ==========================================
+# 4. AI 策略大腦 (Gemini Integration)
+# ==========================================
+def get_ai_strategy(metrics, api_key):
+    if not api_key:
+        return "等待 API Key 輸入...", "neutral"
     
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-pro')
     
-    # 判斷技術面狀態文字
-    tech_status = []
-    if rsi > 75: tech_status.append("🔴 RSI過熱")
-    elif rsi < 25: tech_status.append("🟢 RSI超賣")
-    else: tech_status.append("⚪ RSI中性")
-    
-    if tw_spot > ma5: tech_status.append("🟢 站上MA5")
-    else: tech_status.append("🔴 跌破MA5")
+    # 準備 System Prompt
+    system_instruction = """
+    【角色設定】
+    你是一位嚴守紀律的頂尖選擇權操盤手。你的風格是：「順勢 (看價差)、防守 (看 MA5)、避險 (看 VIX)」。
+    不做預測，只根據數據給出當下的操作對策。回答必須簡潔有力，繁體中文，限 50 字以內，並給出一個「情緒信號」(Bullish/Bearish/Neutral/Warning)。
 
-    prompt = f"""
-    請用繁體中文進行高精準度盤勢分析。
+    【判讀邏輯】
+    1. 價差：正價差 (>+50) 為多頭保護傘；轉負或大幅收斂則撤退。
+    2. VIX：> 20 (恐慌/權利金貴 -> 買方宜短進短出)；< 15 (安逸/權利金便宜 -> 適合波段)。
+    3. RSI+MA：RSI > 80 絕對過熱禁止追價；跌破 MA5 多單減碼。
 
-    === 1. 全方位數據 ===
-    - **台指期**: {tx:.0f}
-    - **期現價差**: {spread:.0f} (動能: {delta:.0f})
-    - **美股 NVDA**: {nvda_chg:.2f}%
-    - **VIX 恐慌指數**: {vix:.2f} (判斷權利金貴賤)
-    - **RSI (14)**: {rsi:.1f} ({tech_status[0]})
-    - **MA5 位置**: {ma5:.0f} ({tech_status[1]})
-
-    === 2. 策略邏輯 ===
-    {STRATEGY_CONTEXT}
-
-    === 3. 分析結論 ===
-    請給我簡潔的決策儀表板：
-    1. 【盤勢訊號】：(例如：🟢 軋空噴出 / 🔴 過熱拉回 / 🟡 震盪整理)
-    2. 【關鍵變數】：指出目前影響最大的指標 (是VIX太高？還是RSI過熱？還是價差擴大？)
-    3. 【操盤指令】：針對 Buy Call 部位，給出明確指令 (續抱/減碼/移動停利/空手)。
+    【Few-Shot 範例】
+    - 情境：價差 +100，VIX 14，MA5 上方。 -> 回答：趨勢強勁，正價差擴大，VIX 低檔適合波段多單續抱。
+    - 情境：RSI 85，價差收斂至 10。 -> 回答：指標嚴重過熱，價差示警，建議多單獲利了結，切勿追高。
+    - 情境：跌破 MA5，VIX 暴漲至 25。 -> 回答：籌碼潰散，避險情緒高漲，立即止損或反手建立避險部位。
     """
     
+    # 準備 User Data
+    user_prompt = f"""
+    當前市場數據：
+    - 台股現貨: {metrics['spot_price']:.2f} (與 MA5 距離: {metrics['ma5_diff']:.2f})
+    - 台指期貨: {metrics['future_price']:.2f}
+    - 價差 (Spread): {metrics['spread']:.2f}
+    - VIX 指數: {metrics['vix']:.2f}
+    - RSI (14): {metrics['rsi']:.2f}
+    - NVDA 漲跌幅: {metrics['nvda_pct']:.2f}%
+    
+    請根據上述數據，給出「大字號一句話操作建議」。
+    """
+
     try:
-        res = model.generate_content(prompt)
-        return res.text
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(system_instruction + user_prompt)
+        return response.text.strip(), "analyzed"
     except Exception as e:
-        return f"分析錯誤: {e}"
+        return f"AI 連線錯誤: {str(e)}", "error"
 
 # ==========================================
-# 5. 主程式顯示層
+# 5. 主程式邏輯與介面渲染
 # ==========================================
-st.title("🦅 AI 操盤戰情室 (Ultimate)")
-st.markdown(f"Update: {time.strftime('%H:%M:%S')}")
 
-# 1. 獲取所有數據
-tx_price = get_tw_futures()
-tw_spot, rsi, ma5 = get_technical_analysis()
-nvda_price, nvda_chg, vix = get_us_market_data()
+# 執行數據獲取
+raw_df = fetch_market_data()
+metrics = calculate_technicals(raw_df)
 
-# 2. 計算衍生數據
-if tw_spot != 0:
-    spread = tx_price - tw_spot
-else:
-    spread = 0
+if metrics:
+    # --- 計算 Delta (與上一分鐘/上一次刷新對比) ---
+    last_spread = st.session_state.history['spread']
+    delta_spread = metrics['spread'] - last_spread if last_spread is not None else 0
+    
+    # 更新 Session State
+    st.session_state.history.update({
+        'price': metrics['spot_price'],
+        'spread': metrics['spread'],
+        'vix': metrics['vix'],
+        'last_update': datetime.now().strftime("%H:%M:%S")
+    })
 
-spread_delta = spread - st.session_state.prev_spread
-st.session_state.prev_spread = spread
+    # --- 1. Top Bar ---
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        st.markdown(f"### 🛡️ 終極 AI 選擇權戰情室")
+        st.caption(f"最後更新: {st.session_state.history['last_update']}")
+    with c2:
+        if st.button("🔄 刷新"):
+            st.rerun()
 
-# 3. 顯示數據矩陣 (3x2 排列)
-c1, c2, c3 = st.columns(3)
-c1.metric("台指期 (TX)", f"{tx_price:.0f}", f"{spread:.0f} (價差)")
-c2.metric("VIX 恐慌指數", f"{vix:.2f}", "權利金水位")
-c3.metric("NVDA 漲跌", f"{nvda_chg:.2f}%", f"{nvda_price:.2f}")
-
-c4, c5, c6 = st.columns(3)
-c4.metric("價差動能 (Delta)", f"{spread_delta:.0f}", "多空力道")
-c5.metric("RSI 強弱", f"{rsi:.1f}", "80過熱/20超賣")
-c6.metric("MA5 均線", f"{ma5:.0f}", "短線防守")
-
-st.divider()
-
-# 4. AI 戰略分析
-st.subheader("🤖 戰略指揮中心")
-
-if auto_refresh:
-    with st.spinner("AI 正在綜合運算 RSI, VIX 與 籌碼數據..."):
-        advice = get_gemini_analysis(gemini_api_key, tx_price, spread, spread_delta, nvda_chg, vix, rsi, ma5, tw_spot)
+    # --- 2. AI 信號燈 ---
+    st.markdown("---")
+    if api_key:
+        with st.spinner("AI 戰略計算中..."):
+            advice, status = get_ai_strategy(metrics, api_key)
         
-        # 顯示樣式
-        if "續抱" in advice or "軋空" in advice:
-            st.success(advice)
-        elif "平倉" in advice or "減碼" in advice:
-            st.error(advice)
+        if "止損" in advice or "避險" in advice or "撤退" in advice:
+            st.error(f"🤖 **AI 戰略官**: {advice}")
+        elif "續抱" in advice or "多單" in advice:
+            st.success(f"🤖 **AI 戰略官**: {advice}")
         else:
-            st.warning(advice)
-else:
-    st.info("勾選左側「啟動全自動監控」以獲取分析。")
+            st.info(f"🤖 **AI 戰略官**: {advice}")
+    else:
+        st.warning("請輸入 API Key 以獲取 AI 建議")
 
-# 頁尾
-st.caption("Data Sources: Taifex (Crawler), Yahoo Finance (API)")
+    # --- 3. 數據矩陣 (3x2 Grid) ---
+    # Row 1: TX & Spread
+    col1, col2 = st.columns(2)
+    with col1:
+        # 台指期
+        st.metric(
+            label="台指期 (TX)",
+            value=f"{metrics['future_price']:.0f}",
+            delta=f"{metrics['spot_price'] - metrics['future_price']:.1f} (基差)"
+        )
+    with col2:
+        # 價差 (Spread) Logic
+        spread_val = metrics['spread']
+        spread_color = "normal"
+        if spread_val > 50: spread_icon = "🟢" # 強多
+        elif spread_val < 0: spread_icon = "🔴" # 轉空
+        else: spread_icon = "🟡"
         
+        st.metric(
+            label=f"現貨價差 {spread_icon}",
+            value=f"{spread_val:.1f}",
+            delta=f"{delta_spread:.1f}",
+            delta_color="normal" # 自定義顏色邏輯可透過 CSS 進階處理
+        )
+        if spread_val > 50:
+            st.caption("🔥 正價差顯著 (多方優勢)")
+        elif spread_val < -10:
+            st.caption("⚠️ 逆價差擴大 (空方警戒)")
+
+    # Row 2: VIX & NVDA
+    col3, col4 = st.columns(2)
+    with col3:
+        vix_val = metrics['vix']
+        vix_delta = 0 # 簡化，可做 VIX delta
+        st.metric(
+            label="VIX 恐慌指數",
+            value=f"{vix_val:.2f}",
+            delta=None,
+            delta_color="inverse"
+        )
+        if vix_val > 20:
+            st.markdown(":red[**高波動警戒**]")
+        elif vix_val < 15:
+            st.markdown(":green[**低波段安逸**]")
+            
+    with col4:
+        st.metric(
+            label="NVDA (美股風向)",
+            value=f"{metrics['nvda_pct']:.2f}%",
+            delta=f"{metrics['nvda_pct']:.2f}%"
+        )
+
+    # Row 3: RSI & MA5
+    col5, col6 = st.columns(2)
+    with col5:
+        rsi_val = metrics['rsi']
+        st.metric(label="RSI (14) 強弱", value=f"{rsi_val:.1f}")
+        if rsi_val > 80: st.caption("🔥 過熱 (勿追高)")
+        elif rsi_val < 20: st.caption("❄️ 超賣 (醞釀反彈)")
+        
+    with col6:
+        ma5_diff = metrics['ma5_diff']
+        state_text = "站穩 MA5 🔼" if ma5_diff > 0 else "跌破 MA5 🔽"
+        st.metric(
+            label="MA5 均線位置",
+            value=f"{metrics['ma5']:.0f}",
+            delta=f"{ma5_diff:.1f}"
+        )
+        st.caption(state_text)
+
+else:
+    st.error("無法獲取市場數據，請檢查網絡或稍後重試。")
+
+# Footer / Disclaimer
+st.markdown("---")
+st.caption("⚠️ 免責聲明：本工具僅供輔助分析，AI 建議不代表投資決策。台指期數據源自 Yahoo Finance 可能有延遲。")
+```
+
+### 檔案 2: `requirements.txt`
+
+```text
+streamlit>=1.30.0
+yfinance>=0.2.36
+pandas>=2.0.0
+numpy>=1.24.0
+google-generativeai>=0.3.2
+streamlit-autorefresh>=1.0.1
+```
+
+### 如何運行
+
+1.  **安裝依賴**:
+    ```bash
+    pip install -r requirements.txt
+    ```
+2.  **獲取 API Key**: 前往 [Google AI Studio](https://aistudio.google.com/) 申請免費的 Gemini API Key。
+3.  **啟動程式**:
+    ```bash
+    streamlit run app.py
+    ```
+
+### 設計亮點解析
+
+1.  **Mobile-First 格狀佈局**:
+    - 使用 `st.metric` 搭配自定義 CSS，確保在手機小螢幕上數據清晰易讀，不會過度擁擠。
+    - 3x2 的 `st.columns` 設計讓手指滑動瀏覽非常順暢。
+
+2.  **AI 戰略核心 (System Prompt)**:
+    - 嚴格遵守您要求的「順勢、防守、避險」邏輯。
+    - 使用 Few-Shot Prompting (情境範例) 讓 Gemini 輸出的建議像一個真正的操盤手，而不是通用的 AI 回答。
+
+3.  **數據即時性與容錯**:
+    - 使用 `st_autorefresh` 實現儀表板自動更新。
+    - 針對 `yfinance` 可能的連線問題做了 `try-except` 包裹，避免 App 崩潰。
+    - 價差計算邏輯包含 `Delta` 比較，利用 `st.session_state` 記住上一刻的數據，讓使用者能感知「變化速度」。
+
+4.  **視覺化警示**:
+    - 當 VIX > 20 或 RSI > 80 時，介面會顯示額外的紅字警告，符合「戰情室」一目了然的需求。
