@@ -3,3 +3,5 @@ yfinance
 google-generativeai
 fugle-marketdata
 streamlit-autorefresh
+pandas
+numpy
