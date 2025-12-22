@@ -77,7 +77,7 @@ def get_fugle_data(symbol: str, api_key: str) -> dict:
         return None
     
     try:
-        client = RestStockClient(api_key=api_key)
+        client = RestClient(api_key=api_key)
         stock = client.stock  # Stock API 進入點
         
         # 取得個股即時報價 (intraday/quote)
