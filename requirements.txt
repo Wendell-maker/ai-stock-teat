@@ -1,7 +1,8 @@
 streamlit
-yfinance
 google-generativeai
 fugle-marketdata
+yfinance
 streamlit-autorefresh
 pandas
 numpy
+requests
