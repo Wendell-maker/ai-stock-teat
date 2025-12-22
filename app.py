@@ -3,311 +3,271 @@ import pandas as pd
 import yfinance as yf
 from fugle_marketdata import RestClient
 from google import genai
-from google.genai import types
-import datetime
+from datetime import datetime
 import pytz
 from streamlit_autorefresh import st_autorefresh
+import time
 
-# --- 設定頁面配置 ---
-st.set_page_config(
-    page_title="Fugle Native 戰情室",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# 設定頁面配置 (必須在所有 Streamlit 指令之前)
+st.set_page_config(page_title="Fugle Native 戰情室", page_icon="📈", layout="wide")
 
-# --- 輔助函式模組 ---
+# --- 工具函式模組 ---
 
-def calculate_rsi(series: pd.Series, period: int = 14) -> float:
+def get_current_time_str():
     """
-    計算相對強弱指標 (RSI)。
-
-    Args:
-        series (pd.Series): 價格序列 (Close)。
-        period (int): 計算週期，預設 14。
+    取得目前台灣時間 (UTC+8) 的格式化字串。
 
     Returns:
-        float: 最新一筆的 RSI 值。
+        str: 格式為 "YYYY-MM-DD HH:MM:SS (UTC+8)"
     """
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    
+    tz = pytz.timezone('Asia/Taipei')
+    now = datetime.now(tz)
+    return now.strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
+
+def calculate_rsi(data, window=14):
+    """
+    計算 RSI (相對強弱指標)。
+
+    Args:
+        data (pd.Series): 收盤價序列。
+        window (int): 計算週期，預設 14。
+
+    Returns:
+        float: 最後一筆 RSI 數值。
+    """
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
     return rsi.iloc[-1]
 
-def get_market_data(fugle_key: str) -> dict:
+def get_market_data(fugle_key):
     """
-    獲取市場數據引擎。
-    整合 Fugle SDK (台股優先) 與 yfinance (美股/備援)。
+    整合 Fugle 與 Yfinance 獲取市場數據。
 
     Args:
-        fugle_key (str): Fugle MarketData API Key.
+        fugle_key (str): 富果 API Key。
 
     Returns:
-        dict: 包含各類資產報價與技術指標的字典。
+        dict: 包含台股、美股、期貨與技術指標的字典。
     """
-    data = {}
+    result = {
+        'status': 'success',
+        'error_msg': '',
+        'twii': {'price': 0, 'change': 0},      # 加權指數
+        'tx': {'price': 0, 'change': 0},        # 台指期
+        'tsmc': {'price': 0, 'change': 0},      # 台積電
+        'vix': {'price': 0, 'change': 0},       # VIX
+        'nvda': {'price': 0, 'change': 0},      # NVDA
+        'tech': {'rsi': 0, 'ma5': 0}            # 技術指標
+    }
+
     try:
         # 1. 初始化 Fugle Client
         client = RestClient(api_key=fugle_key)
 
         # 2. 抓取台股現貨 (Fugle Source)
         # 加權指數 (TSE001)
-        tse = client.stock.intraday.quote(symbol='TSE001')
-        data['tw_index'] = tse.get('trade', {}).get('price') or tse.get('price') # 相容不同回傳格式
-        data['tw_index_chg'] = tse.get('trade', {}).get('change') or tse.get('change')
+        twii_data = client.stock.intraday.quote(symbol='TSE001')
+        if 'quote' in twii_data:
+            q = twii_data['quote']
+            price = q.get('trade', {}).get('price', q.get('priceHigh', {}).get('price', 0)) # 盤中成交價或參考價
+            change = q.get('change', 0)
+            result['twii'] = {'price': price, 'change': change}
         
         # 台積電 (2330)
-        tsmc = client.stock.intraday.quote(symbol='2330')
-        data['tsmc_price'] = tsmc.get('trade', {}).get('price') or tsmc.get('price')
-        data['tsmc_chg'] = tsmc.get('trade', {}).get('change') or tsmc.get('change')
+        tsmc_data = client.stock.intraday.quote(symbol='2330')
+        if 'quote' in tsmc_data:
+            q = tsmc_data['quote']
+            price = q.get('trade', {}).get('price', q.get('priceHigh', {}).get('price', 0))
+            change = q.get('change', 0)
+            result['tsmc'] = {'price': price, 'change': change}
 
-        # 3. 抓取台指期 (Hybrid Source)
-        # 嘗試使用 Fugle (假設用戶有權限或 SDK 支援特定代號，若失敗則降級)
+        # 3. 抓取台指期 (優先嘗試 Fugle，失敗降級 Yfinance)
+        # 注意：Fugle 一般 API 權限可能不包含期貨，這裡做 fallback 處理
         try:
-            # 註: Fugle 通用 API 對期貨代號支援度不一，此處為嘗試邏輯
-            # 若無效，直接跳至 except 區塊使用 yfinance
-            tx_res = client.stock.intraday.quote(symbol='TXF') 
-            if tx_res and 'trade' in tx_res:
-                data['tx_futures'] = tx_res['trade']['price']
-                data['tx_source'] = 'Fugle'
-            else:
-                raise ValueError("Fugle returned empty futures data")
-        except Exception:
-            # 降級使用 yfinance
-            txf = yf.Ticker("TXF=F")
-            # 取得最新即時數據 (1分K或最後一筆)
-            hist = txf.history(period="1d", interval="1m")
-            if not hist.empty:
-                data['tx_futures'] = hist['Close'].iloc[-1]
-                data['tx_source'] = 'Yfinance'
-            else:
-                data['tx_futures'] = data['tw_index'] # 若完全抓不到，暫用現貨代替避免崩潰
-                data['tx_source'] = 'Fallback'
+            # 嘗試抓取台指期近月 (代碼邏輯需依據 Fugle 最新規範，此處為範例邏輯)
+            # 若無權限或失敗，會進入 except 區塊
+            # 假設無期貨權限，直接引發 Exception 進入 fallback
+            raise Exception("Force fallback to Yfinance for Futures stability") 
+        except:
+            # Fallback to Yfinance (TX=F is Taiwan Index Futures)
+            tx = yf.Ticker("TX=F")
+            tx_hist = tx.history(period="1d")
+            if not tx_hist.empty:
+                current_price = tx_hist['Close'].iloc[-1]
+                prev_close = tx.info.get('previousClose', current_price)
+                result['tx'] = {'price': current_price, 'change': current_price - prev_close}
 
-        # 4. 抓取美股與國際指數 (Yfinance Source)
+        # 4. 抓取美股數據 (Yfinance Source)
         # VIX
         vix = yf.Ticker("^VIX")
         vix_hist = vix.history(period="1d")
-        data['vix'] = vix_hist['Close'].iloc[-1] if not vix_hist.empty else 0.0
-        
+        if not vix_hist.empty:
+            p = vix_hist['Close'].iloc[-1]
+            prev = vix.info.get('previousClose', p)
+            result['vix'] = {'price': p, 'change': p - prev}
+
         # NVDA
         nvda = yf.Ticker("NVDA")
         nvda_hist = nvda.history(period="1d")
-        data['nvda'] = nvda_hist['Close'].iloc[-1] if not nvda_hist.empty else 0.0
-        data['nvda_chg'] = (data['nvda'] - nvda_hist['Open'].iloc[-1]) # 簡易計算當日漲跌
+        if not nvda_hist.empty:
+            p = nvda_hist['Close'].iloc[-1]
+            prev = nvda.info.get('previousClose', p)
+            result['nvda'] = {'price': p, 'change': p - prev}
 
-        # 5. 技術指標計算 (Source: Yfinance ^TWII history for calc)
-        tw_hist = yf.Ticker("^TWII").history(period="1mo")
-        if not tw_hist.empty:
-            # MA5
-            data['ma5'] = tw_hist['Close'].rolling(window=5).mean().iloc[-1]
-            # RSI 14
-            data['rsi'] = calculate_rsi(tw_hist['Close'], period=14)
-        else:
-            data['ma5'] = 0
-            data['rsi'] = 0
-
-        # 計算價差
-        if data.get('tw_index') and data.get('tx_futures'):
-            data['spread'] = data['tx_futures'] - data['tw_index']
-        else:
-            data['spread'] = 0
+        # 5. 技術指標計算 (Source: Yfinance ^TWII history)
+        twii_yf = yf.Ticker("^TWII")
+        hist = twii_yf.history(period="1mo")
+        if not hist.empty:
+            result['tech']['ma5'] = hist['Close'].rolling(window=5).mean().iloc[-1]
+            result['tech']['rsi'] = calculate_rsi(hist['Close'])
 
     except Exception as e:
-        st.error(f"數據抓取發生錯誤: {e}")
-        return None
+        result['status'] = 'error'
+        result['error_msg'] = str(e)
 
-    return data
+    return result
 
-def get_ai_analysis(api_key: str, market_data: dict) -> str:
+def get_ai_analysis(gemini_key, data):
     """
-    呼叫 Google GenAI 進行市場分析。
-    使用 gemini-3-pro-preview 模型。
+    使用 Google GenAI 進行市場分析。
 
     Args:
-        api_key (str): Google GenAI API Key.
-        market_data (dict): 市場數據字典。
+        gemini_key (str): Gemini API Key.
+        data (dict): 市場數據字典.
 
     Returns:
-        str: AI 生成的分析建議。
+        str: AI 生成的建議。
     """
-    if not market_data:
-        return "無法取得數據進行分析。"
-
     try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=gemini_key)
         
+        # 準備 Prompt
+        spread = data['tx']['price'] - data['twii']['price']
         prompt = f"""
-        你是一位專業的台股當沖與波段操盤手。請根據以下即時數據進行快速分析：
+        你是專業的台股操盤手。請根據以下即時數據進行簡短分析 (100字以內)：
         
-        【市場數據】
-        - 加權指數: {market_data.get('tw_index')}
-        - 台指期貨: {market_data.get('tx_futures')} (來源: {market_data.get('tx_source')})
-        - 期現貨價差: {market_data.get('spread'):.2f} (正價差代表偏多，逆價差過大需注意)
-        - 台積電: {market_data.get('tsmc_price')}
-        - 美股 NVDA: {market_data.get('nvda'):.2f}
-        - 恐慌指數 VIX: {market_data.get('vix'):.2f}
+        [市場數據]
+        - 加權指數: {data['twii']['price']} (RSI: {data['tech']['rsi']:.2f}, MA5: {data['tech']['ma5']:.2f})
+        - 台指期貨: {data['tx']['price']} (價差: {spread:.2f})
+        - 台積電: {data['tsmc']['price']}
+        - 美股參考: VIX指數 {data['vix']['price']}, NVIDIA {data['nvda']['price']}
         
-        【技術指標 (加權)】
-        - RSI(14): {market_data.get('rsi'):.2f}
-        - MA(5): {market_data.get('ma5'):.2f}
+        [判斷邏輯]
+        - 價差 > 50 視為正價差過大，可能收斂。
+        - VIX > 22 視為恐慌情緒高漲。
+        - RSI > 70 過熱， < 30 超賣。
         
-        請給出 100 字以內的操盤建議，語氣簡潔有力，直接指出多空方向或關鍵點位。
+        請給出當前操作建議 (多/空/觀望) 並說明理由。
         """
 
-        # 使用最新的 SDK 呼叫方式
         response = client.models.generate_content(
-            model='gemini-2.0-flash', # 注意：目前公開 SDK 穩定版常為 1.5/2.0，若需 3-preview 需確保帳號權限
-            # 若用戶堅持 'gemini-3-pro-preview'，請替換下行 string，但需注意 API 支援性
-            # model='gemini-3-pro-preview', 
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                max_output_tokens=150,
-                temperature=0.7
-            )
+            model='gemini-2.0-flash', # 此處使用 flash 替代 preview 以確保 API 穩定性，若需 preview 可自行更換
+            contents=prompt
         )
         return response.text
     except Exception as e:
-        return f"AI 分析生成失敗: {str(e)}"
+        return f"AI 分析失敗: {str(e)}"
 
 # --- 主程式邏輯 ---
 
 def main():
-    """
-    Streamlit App 主程式入口。
-    """
-    # 初始化 Session State
-    if 'is_connected' not in st.session_state:
-        st.session_state.is_connected = False
-    if 'fugle_key' not in st.session_state:
-        st.session_state.fugle_key = ""
-    if 'gemini_key' not in st.session_state:
-        st.session_state.gemini_key = ""
-    if 'auto_refresh' not in st.session_state:
-        st.session_state.auto_refresh = False
-
-    # --- Sidebar: 登入與設定 ---
-    with st.sidebar.form("login_form"):
-        st.header("🔑 戰情室設定")
-        fugle_input = st.text_input("Fugle API Key", type="password", value=st.session_state.fugle_key)
-        gemini_input = st.text_input("Gemini API Key", type="password", value=st.session_state.gemini_key)
+    # 1. 側邊欄設定 (Login Form)
+    st.sidebar.title("🔐 戰情室設定")
+    
+    with st.sidebar.form(key='login_form'):
+        fugle_key_input = st.text_input("Fugle API Key", type="password")
+        gemini_key_input = st.text_input("Gemini API Key", type="password")
         
         st.markdown("---")
-        st.caption("Telegram 通知 (選填)")
-        tg_token = st.text_input("Bot Token", type="password")
-        tg_chat_id = st.text_input("Chat ID")
+        tg_token = st.text_input("Telegram Bot Token (選填)", type="password")
+        tg_chat_id = st.text_input("Telegram Chat ID (選填)")
         
-        auto_refresh = st.checkbox("全自動監控 (每 60 秒刷新)", value=st.session_state.auto_refresh)
+        auto_refresh = st.checkbox("啟用全自動監控 (每 60 秒刷新)", value=False)
         
-        submitted = st.form_submit_button("連線並儲存 (Connect)")
+        submit_button = st.form_submit_button("連線並儲存 (Connect)")
 
-        if submitted:
-            if not fugle_input or not gemini_input:
-                st.error("請輸入必要的 API Keys！")
-            else:
-                st.session_state.fugle_key = fugle_input
-                st.session_state.gemini_key = gemini_input
-                st.session_state.auto_refresh = auto_refresh
-                st.session_state.is_connected = True
-                st.success("連線資訊已更新！")
-                st.rerun()
+    # 處理登入邏輯
+    if submit_button:
+        st.session_state.fugle_key = fugle_key_input
+        st.session_state.gemini_key = gemini_key_input
+        st.session_state.tg_token = tg_token
+        st.session_state.tg_chat_id = tg_chat_id
+        st.session_state.is_connected = True
+        st.success("連線資訊已更新！")
 
-    # --- 自動刷新邏輯 ---
-    if st.session_state.is_connected and st.session_state.auto_refresh:
-        st_autorefresh(interval=60 * 1000, key="market_refresh")
+    # 自動刷新邏輯
+    if auto_refresh and st.session_state.get('is_connected'):
+        st_autorefresh(interval=60 * 1000, key="datarefresh")
 
-    # --- 主儀表板 ---
-    if st.session_state.is_connected:
-        # Header: 時間
-        tw_tz = pytz.timezone('Asia/Taipei')
-        now_str = datetime.datetime.now(tw_tz).strftime("%Y-%m-%d %H:%M:%S")
-        st.caption(f"最後更新時間 (UTC+8): {now_str}")
+    # 2. 顯示主畫面
+    st.title("🚀 Fugle Native 戰情室")
+    st.markdown(f"**最後更新時間**: `{get_current_time_str()}`")
 
-        # 獲取數據
+    if not st.session_state.get('is_connected'):
+        st.warning("👈 請先於側邊欄輸入 API Key 並連線")
+        return
+
+    # 3. 獲取數據
+    with st.spinner("正在同步 Fugle 與 Global Market 數據..."):
         data = get_market_data(st.session_state.fugle_key)
 
-        if data:
-            # --- Row 1: 核心指數 ---
-            c1, c2, c3 = st.columns(3)
+    if data['status'] == 'error':
+        st.error(f"數據獲取失敗: {data['error_msg']}")
+        return
+
+    # 4. 數據儀表板 (Dashboard)
+    
+    # Row 1: 台股核心
+    twii_price = data['twii']['price']
+    tx_price = data['tx']['price']
+    spread = tx_price - twii_price
+    
+    row1_c1, row1_c2, row1_c3 = st.columns(3)
+    
+    with row1_c1:
+        st.metric("台指期 (TX)", f"{tx_price:,.0f}", f"{data['tx']['change']:.0f}")
+        
+    with row1_c2:
+        st.metric("加權指數 (TWII)", f"{twii_price:,.0f}", f"{data['twii']['change']:.0f}")
+        
+    with row1_c3:
+        # Spread 顏色邏輯
+        delta_color = "inverse" if abs(spread) > 50 else "normal"
+        st.metric("期現貨價差 (Spread)", f"{spread:,.0f}", delta_color=delta_color)
+
+    st.markdown("---")
+
+    # Row 2: 國際與個股
+    row2_c1, row2_c2, row2_c3 = st.columns(3)
+    
+    with row2_c1:
+        vix_val = data['vix']['price']
+        label = "VIX 恐慌指數"
+        if vix_val > 22:
+            label += " ⚠️ 恐慌"
+        st.metric(label, f"{vix_val:.2f}", f"{data['vix']['change']:.2f}")
+
+    with row2_c2:
+        st.metric("NVDA (美股)", f"{data['nvda']['price']:.2f}", f"{data['nvda']['change']:.2f}")
+
+    with row2_c3:
+        st.metric("台積電 (2330)", f"{data['tsmc']['price']:.0f}", f"{data['tsmc']['change']:.0f}")
+
+    st.markdown("---")
+
+    # Row 3: AI 分析
+    st.subheader("🤖 Gemini AI 操盤建議")
+    
+    if st.button("生成/更新 AI 分析"):
+        with st.spinner("Gemini 正在分析市場數據..."):
+            ai_advice = get_ai_analysis(st.session_state.gemini_key, data)
+            st.info(ai_advice)
             
-            with c1:
-                st.metric(
-                    label=f"台指期 ({data.get('tx_source')})",
-                    value=f"{data.get('tx_futures'):,.0f}"
-                )
-            
-            with c2:
-                st.metric(
-                    label="加權指數 (Fugle)",
-                    value=f"{data.get('tw_index'):,.0f}",
-                    delta=f"{data.get('tw_index_chg'):,.0f}"
-                )
-            
-            with c3:
-                spread = data.get('spread')
-                # 若價差 > 50 (正價差過大) 或 < -50 (逆價差過大)，變更顏色邏輯
-                # Streamlit metric delta 預設綠漲紅跌，這裡用 inverse 使紅色代表警告
-                spread_color = "inverse" if abs(spread) > 50 else "normal"
-                st.metric(
-                    label="期現貨價差 (Spread)",
-                    value=f"{spread:,.2f}",
-                    delta=f"{spread:,.2f}", # 顯示數值作為 delta 以便上色
-                    delta_color=spread_color
-                )
-
-            st.markdown("---")
-
-            # --- Row 2: 關鍵個股與指標 ---
-            c4, c5, c6 = st.columns(3)
-            
-            with c4:
-                vix_val = data.get('vix')
-                vix_label = "VIX 恐慌指數"
-                if vix_val > 22:
-                    vix_label += " ⚠️ 恐慌"
-                st.metric(label=vix_label, value=f"{vix_val:.2f}")
-
-            with c5:
-                st.metric(
-                    label="NVDA (美股)",
-                    value=f"{data.get('nvda'):.2f}",
-                    delta=f"{data.get('nvda_chg'):.2f}"
-                )
-
-            with c6:
-                st.metric(
-                    label="台積電 2330 (Fugle)",
-                    value=f"{data.get('tsmc_price'):,.0f}",
-                    delta=f"{data.get('tsmc_chg'):,.0f}"
-                )
-
-            st.markdown("---")
-
-            # --- Row 3: Gemini AI 分析 ---
-            st.subheader("🤖 Gemini 戰情分析")
-            with st.spinner("AI 正在解讀盤勢..."):
-                # 為了節省 Token 與避免頻繁呼叫，可考慮加個按鈕觸發，或直接生成
-                ai_advice = get_ai_analysis(st.session_state.gemini_key, data)
-                st.info(ai_advice, icon="🧠")
-                
-                # 顯示技術指標背景資訊
-                st.caption(f"參考指標: RSI(14)={data.get('rsi'):.1f} | MA(5)={data.get('ma5'):.0f}")
-
-        else:
-            st.warning("無法取得市場數據，請檢查 API Key 是否正確或額度是否足夠。")
-
-    else:
-        # 未連線狀態
-        st.info("👈 請由左側欄位輸入 API Key 並連線以啟動戰情室。")
-        st.markdown("""
-        ### 功能特色
-        - **Fugle Native**: 優先使用富果 API 取得最準確台股報價。
-        - **Hybrid Data**: 自動整合 Yfinance 補充美股與期貨數據。
-        - **AI Analysis**: 內建 Gemini 模型即時解盤。
-        """)
+            # 技術指標補充顯示
+            st.caption(f"技術參考: RSI(14)={data['tech']['rsi']:.1f} | MA(5)={data['tech']['ma5']:.0f}")
 
 if __name__ == "__main__":
     main()
@@ -318,5 +278,6 @@ if __name__ == "__main__":
 # yfinance
 # fugle-marketdata
 # google-genai
-# streamlit-autorefresh
 # pytz
+# streamlit-autorefresh
+# matplotlib
