@@ -4,7 +4,7 @@ import requests
 import pandas as pd
 import numpy as np
 from bs4 import BeautifulSoup
-from google import genai
+import google.generativeai as genai
 from streamlit_autorefresh import st_autorefresh
 import json
 
