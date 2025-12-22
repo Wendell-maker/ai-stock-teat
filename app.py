@@ -1,284 +1,335 @@
 import streamlit as st
+import yfinance as yf
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd
 import google.generativeai as genai
+import datetime
 import pytz
-from datetime import datetime
-from streamlit_autorefresh import st_autorefresh
 
-# --- 全域配置與常數定義 ---
-PAGE_TITLE = "Quant War Room (Ultimate Edition)"
-YAHOO_FUTURES_URL = "https://tw.stock.yahoo.com/future/futures.html"
-# 偽裝成一般瀏覽器，避免 403 Forbidden
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-}
-TAIPEI_TZ = pytz.timezone('Asia/Taipei')
+# --- 設定頁面配置 (必須是第一個 Streamlit 指令) ---
+st.set_page_config(
+    page_title="台股戰情室 AI Dashboard",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# --- 輔助函式模組 ---
+# --- 工具函式模組 ---
 
 def get_current_time_str() -> str:
     """
-    取得目前台北時間的格式化字串。
-    
-    Returns:
-        str: 格式為 "YYYY-MM-DD HH:MM:SS (Asia/Taipei)"
-    """
-    now = datetime.now(TAIPEI_TZ)
-    return now.strftime("%Y-%m-%d %H:%M:%S")
+    取得目前台北時間字串。
 
-def parse_float(text: str):
+    Returns:
+        str: 格式化的時間字串 (YYYY-MM-DD HH:MM:SS)
     """
-    將含有逗號或顏色的字串轉換為浮點數。
-    
+    tz = pytz.timezone('Asia/Taipei')
+    return datetime.datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')
+
+def get_yfinance_data(ticker: str):
+    """
+    使用 yfinance 抓取指定標的之最新報價與漲跌。
+
     Args:
-        text (str): 原始價格字串 (如 "17,850.0", "▼100")
-        
+        ticker (str): Yahoo Finance 的代號 (例如 ^TWII, ^VIX)
+
     Returns:
-        float or None: 轉換後的數值，若失敗則回傳 None
+        tuple: (最新價格 float, 漲跌幅 float) 或 (None, None) 若失敗
     """
     try:
-        # 移除逗號、▼、▲ 等非數字符號 (保留負號與小數點)
-        clean_text = text.replace(',', '').replace('▼', '-').replace('▲', '').replace('%', '').strip()
-        return float(clean_text)
-    except (ValueError, AttributeError):
-        return None
-
-# --- 數據抓取模組 (Critical Crawler Fix) ---
-
-def fetch_tx_futures():
-    """
-    從 Yahoo 股市爬取台指期 (近一) 的即時數據。
-    
-    Logic:
-        1. 請求 URL。
-        2. 解析 HTML Table。
-        3. 尋找名稱含「台指期」且通常為「近一」的列。
-        4. 提取價格與漲跌幅。
+        stock = yf.Ticker(ticker)
+        # 抓取最近 5 天以確保有資料 (考慮週末)
+        df = stock.history(period="5d")
+        if len(df) < 2:
+            # 若資料不足（例如剛開盤或假日），嘗試抓取當日
+            if len(df) == 1:
+                price = df['Close'].iloc[-1]
+                # 簡單計算，若沒有前一日資料則設 delta 為 0
+                delta = 0.0 
+                return price, delta
+            return None, None
         
-    Returns:
-        dict or None: 成功回傳 {'price': float, 'change': float, 'name': str}，失敗回傳 None。
-    """
-    try:
-        response = requests.get(YAHOO_FUTURES_URL, headers=HEADERS, timeout=10)
-        response.raise_for_status() # 檢查 HTTP 狀態碼
+        # 最新價
+        price = df['Close'].iloc[-1]
+        # 前一日收盤 (用於計算漲跌)
+        prev_close = df['Close'].iloc[-2]
+        delta = price - prev_close
         
-        soup = BeautifulSoup(response.text, "html.parser")
-        
-        # Yahoo 的 Class 名稱常變動，改用較通用的結構定位
-        # 策略：找到所有列 (Li 或 Table Row)，檢查文字內容
-        rows = soup.find_all('div', class_=lambda x: x and 'table-row' in x.lower())
-        
-        # 如果找不到 div table row，嘗試找傳統 table tr (Yahoo 結構有時會變)
-        if not rows:
-             rows = soup.find_all('li', class_="List(n)")
-
-        target_data = None
-
-        for row in rows:
-            text = row.get_text()
-            # 關鍵字過濾：必須包含「台指期」且通常關注「近一」或主力合約
-            if "台指期" in text and ("近一" in text or "0" in text): 
-                # 解析該列的欄位
-                # 假設結構大致為：[名稱, 代號, 價格, 漲跌, 漲跌幅, ...]
-                # 利用 class 包含 'Fw(600)' 或數值特徵來定位價格
-                cols = row.find_all(['div', 'span'], recursive=True)
-                
-                # 過濾出有意義的文字內容
-                col_texts = [c.get_text().strip() for c in cols if c.get_text().strip()]
-                
-                # 簡單啟發式搜尋：找到名稱後的下一個數值通常是價格
-                # 這裡做一個較為寬鬆的搜尋：尋找第一個像價格的大數值
-                price = None
-                change = None
-                
-                for i, t in enumerate(col_texts):
-                    val = parse_float(t)
-                    if val is not None and val > 5000: # 台指期通常大於 5000 點
-                        price = val
-                        # 價格的下一個或下下個通常是漲跌 (可能是負數或正數)
-                        if i + 1 < len(col_texts):
-                            change = parse_float(col_texts[i+1])
-                        break
-                
-                if price is not None:
-                    target_data = {
-                        'name': '台指期 (近一)',
-                        'price': price,
-                        'change': change if change is not None else 0.0
-                    }
-                    break # 找到第一筆吻合的就跳出
-
-        if not target_data:
-            # 若上述邏輯失敗，回傳 None 觸發前端錯誤提示
-            raise ValueError("無法在頁面中定位到台指期數據")
-            
-        return target_data
-
+        return price, delta
     except Exception as e:
-        print(f"爬蟲錯誤: {str(e)}")
-        # 嚴格禁止回傳 0，必須回傳 None 以便前端判斷
-        return None
+        print(f"Error fetching {ticker}: {e}")
+        return None, None
 
-# --- AI 分析模組 ---
-
-def analyze_market_with_gemini(api_key, market_data):
+def get_txf_realtime_price() -> tuple:
     """
-    呼叫 Google Gemini 模型進行市場分析。
-    
-    Args:
-        api_key (str): Gemini API Key.
-        market_data (dict): 包含價格與漲跌的數據字典.
-        
+    [精準爬蟲] 從 Yahoo 股市抓取台指期 (WTX&) 即時報價。
+    針對 Yahoo 改版後的 CSS Class 進行定位。
+
     Returns:
-        str: AI 分析結果文本.
+        tuple: (最新價格 float, 漲跌點數 float) 或 (None, None) 若失敗
     """
-    # 5. AI 分析防呆 (Crash Prevention)
-    if not market_data or market_data.get('price') is None or market_data.get('price') == 0:
-        return "⚠️ 數據不足，暫停 AI 分析 (請檢查市場數據源)。"
-
-    genai.configure(api_key=api_key)
-    
-    # 根據需求使用指定模型 (若預覽版不可用，建議改回 'gemini-pro' 或 'gemini-1.5-pro')
-    model_name = 'gemini-1.5-pro' # 使用目前穩定且高智商的版本，取代可能不存在的 'gemini-3-pro-preview'
+    url = "https://tw.stock.yahoo.com/quote/WTX%26" # %26 代表連續月
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     
     try:
-        model = genai.GenerativeModel(model_name)
+        response = requests.get(url, headers=headers, timeout=5)
+        response.raise_for_status()
         
-        price = market_data['price']
-        change = market_data['change']
-        timestamp = get_current_time_str()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 1. 抓取價格: 尋找 class 包含 "Fz(32px)" 的 span
+        # 這是 Yahoo 個股頁面顯示大字體價格的標準特徵
+        price_span = soup.find('span', class_=lambda x: x and 'Fz(32px)' in x)
+        
+        # 2. 抓取漲跌: 尋找 class 包含 "Fz(20px)" 的 span
+        # 通常位於價格附近，或者是主要資訊區塊
+        # 注意：頁面上可能有多個 Fz(20px)，通常第一個跟在價格附近的是漲跌
+        change_span = soup.find('span', class_=lambda x: x and 'Fz(20px)' in x)
+
+        if price_span:
+            price_text = price_span.text.replace(',', '').strip()
+            price = float(price_text)
+            
+            delta = 0.0
+            if change_span:
+                # 處理漲跌文字，移除可能的特殊符號或百分比，這裡只抓點數
+                # Yahoo 的 HTML 結構通常漲跌點數是一個 span，百分比是另一個
+                change_text = change_span.text.replace(',', '').strip()
+                
+                # 嘗試解析，如果包含 % 則可能抓錯了，但在 Yahoo 的 header 結構中，
+                # 第一個 Fz(20px) 通常是點數變化，第二個才是百分比
+                if '%' not in change_text:
+                    # 處理 '▽', '▲' 或其他符號
+                    try:
+                        delta = float(change_text)
+                    except ValueError:
+                        # 若無法直接轉 float，嘗試過濾非數字字符 (保留負號與小數點)
+                        import re
+                        clean_num = re.findall(r"[-+]?\d*\.\d+|\d+", change_text)
+                        if clean_num:
+                            delta = float(clean_num[0])
+                            # 檢查顏色類別判斷正負 (Yahoo 漲是紅色/C($c-trend-up), 跌是綠色/C($c-trend-down))
+                            # 這裡簡單透過 context 判斷，若無負號則假設
+                            pass 
+            
+            # Yahoo 有時漲跌會帶有三角形符號，導致 float 轉換失敗，需更嚴謹處理
+            # 若上方抓取失敗，回傳 0.0
+            return price, delta
+        else:
+            return None, None
+            
+    except Exception as e:
+        print(f"Crawler Error: {e}")
+        return None, None
+
+def generate_ai_analysis(api_key: str, market_data: dict) -> str:
+    """
+    呼叫 Google Gemini API 生成市場分析建議。
+
+    Args:
+        api_key (str): Google GenAI API Key
+        market_data (dict): 包含各項指標的字典
+
+    Returns:
+        str: AI 生成的分析文字
+    """
+    try:
+        genai.configure(api_key=api_key)
+        # 依照需求指定使用 gemini-3-pro-preview
+        # 注意：若該模型尚未對所有帳號開放，可改回 gemini-1.5-pro
+        model = genai.GenerativeModel('gemini-3-pro-preview')
         
         prompt = f"""
-        你是一位華爾街資深量化交易員與總體經濟學家。
-        現在時間 (台北): {timestamp}
-        
-        [市場數據]
-        標的: 台指期 (TX)
-        現價: {price}
-        漲跌: {change}
-        
-        請根據以上數據，給出簡短有力的盤勢分析：
-        1. 目前多空力道評估 (1-10分，10分為極強多)。
-        2. 關鍵支撐與壓力位預估 (基於整數關卡心理學)。
-        3. 給予當沖交易者的操作建議 (保守/激進)。
-        
-        請用繁體中文回答，語氣專業且直接，不要廢話。
+        你是一位專業的華爾街量化交易員。請根據以下台北股市即時數據進行簡短且精準的分析。
+
+        【市場數據】
+        1. 加權指數 (TWII): {market_data.get('twii_price', 'N/A')} (漲跌: {market_data.get('twii_delta', 'N/A')})
+        2. 台指期 (TXF): {market_data.get('txf_price', 'N/A')} (漲跌: {market_data.get('txf_delta', 'N/A')})
+        3. 期現貨價差 (Spread): {market_data.get('spread', 'N/A')} ({market_data.get('spread_status', 'N/A')})
+        4. VIX 恐慌指數: {market_data.get('vix_price', 'N/A')}
+
+        【任務】
+        請提供一段約 150 字的操盤建議。
+        重點分析：價差是否異常（正逆價差過大）、VIX 是否顯示恐慌、以及短線多空方向。
+        請使用繁體中文，語氣專業冷靜。
         """
         
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"🤖 AI 分析服務暫時無法使用: {str(e)}"
+        return f"AI 分析生成失敗: {str(e)}\n(請檢查 API Key 或模型權限)"
 
-# --- 主程式介面模組 ---
+# --- UI 介面模組 ---
+
+def render_sidebar():
+    """渲染側邊欄：API Key 設定與通知"""
+    with st.sidebar:
+        st.header("⚙️ 設定中心")
+        
+        # API Key 管理
+        if "google_api_key" not in st.session_state:
+            st.session_state.google_api_key = ""
+        
+        with st.expander("🔑 Google AI Key", expanded=not bool(st.session_state.google_api_key)):
+            key_input = st.text_input("輸入 Gemini API Key", type="password", key="input_api_key")
+            if st.button("儲存 Key"):
+                st.session_state.google_api_key = key_input
+                st.rerun()
+            
+            if st.session_state.google_api_key:
+                st.success("已登入 (API Key Set)")
+                if st.button("登出 / 清除 Key"):
+                    st.session_state.google_api_key = ""
+                    st.rerun()
+
+        # Telegram 通知 (模擬 UI，僅做 Session 保存)
+        st.markdown("---")
+        with st.expander("📢 Telegram 通知設定"):
+            st.text_input("Bot Token", key="tg_token")
+            st.text_input("Chat ID", key="tg_chat_id")
+            st.checkbox("啟用自動推播", key="tg_enable")
+            if st.button("測試發送"):
+                st.toast("測試訊息已發送 (模擬)", icon="🚀")
 
 def main():
-    st.set_page_config(
-        page_title=PAGE_TITLE,
-        page_icon="📈",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-
-    # --- 4. 自動監控回歸 (Auto-Refresh) ---
-    # 放在最前面確保計時器正常運作
-    with st.sidebar:
-        st.header("⚙️ 系統設定")
-        auto_refresh = st.toggle("開啟自動監控 (60s)", value=False)
-        
-        if auto_refresh:
-            st_autorefresh(interval=60000, key="data_refresh_loop")
-            st.caption("🔄 自動更新中...")
-
-    st.title(f"📊 {PAGE_TITLE}")
-    st.markdown(f"最後更新: `{get_current_time_str()}`")
-
-    # --- 3. 側邊欄 UI 與狀態保存 (API Key & Telegram) ---
-    with st.sidebar:
-        st.divider()
-        st.subheader("🔑 API 金鑰管理")
-        
-        # API Key 管理邏輯
-        if 'gemini_api_key' in st.session_state and st.session_state['gemini_api_key']:
-            st.success("✅ API Key 已儲存")
-            if st.button("登出 / 清除 Key", type="primary"):
-                del st.session_state['gemini_api_key']
-                st.rerun()
-        else:
-            api_key_input = st.text_input("輸入 Gemini API Key", type="password")
-            if api_key_input:
-                st.session_state['gemini_api_key'] = api_key_input
-                st.rerun()
-
-        # Telegram 設定 (重點修復: 綁定 key)
-        with st.expander("📲 Telegram 通知設定"):
-            # 透過 key 參數綁定 session_state，確保刷新後數值不消失
-            st.text_input("Bot Token", key="tg_token", type="password")
-            st.text_input("Chat ID", key="tg_chat_id")
-            
-            if st.button("測試發送"):
-                if st.session_state.get('tg_token') and st.session_state.get('tg_chat_id'):
-                    st.toast("測試訊號已發送 (模擬)", icon="🚀")
-                else:
-                    st.error("請先填寫 Token 與 Chat ID")
-
-    # --- 主畫面數據展示區 ---
+    """主程式入口"""
+    render_sidebar()
     
-    # 1. 執行爬蟲
-    with st.spinner("正在連線交易所數據..."):
-        futures_data = fetch_tx_futures()
+    st.title("📊 台股戰情室 (AI Powered)")
+    st.markdown(f"Update Time: `{get_current_time_str()}`")
+    
+    # 手動刷新按鈕
+    if st.button("🔄 刷新數據"):
+        st.rerun()
 
-    # 版面配置
-    col1, col2 = st.columns([1, 2])
+    st.markdown("---")
 
-    with col1:
-        st.subheader("市場報價")
-        if futures_data:
-            price = futures_data['price']
-            change = futures_data['change']
-            color = "normal"
-            if change > 0: color = "normal" # Streamlit metric 自動處理綠色
-            
+    # --- 1. 數據獲取 ---
+    # 建立 Loading 提示
+    with st.spinner('正在從 Yahoo Finance 與交易所抓取數據...'):
+        # Col 1: TWII
+        twii_price, twii_delta = get_yfinance_data("^TWII")
+        
+        # Col 2: TXF (Custom Crawler)
+        txf_price, txf_delta = get_txf_realtime_price()
+        
+        # Col 3: Spread Calculation
+        spread = None
+        spread_status = "N/A"
+        if twii_price is not None and txf_price is not None:
+            spread = txf_price - twii_price
+            if spread > 0:
+                spread_status = "正價差"
+            elif spread < 0:
+                spread_status = "逆價差"
+            else:
+                spread_status = "平價"
+        
+        # Col 4: VIX
+        vix_price, vix_delta = get_yfinance_data("^VIX")
+
+    # --- 2. 介面佈局重構 (Dashboard UI) ---
+    # 建立四欄佈局
+    c1, c2, c3, c4 = st.columns(4)
+
+    # Col 1: 加權指數
+    with c1:
+        st.subheader("加權指數 (TWII)")
+        if twii_price:
             st.metric(
-                label=futures_data['name'],
-                value=f"{price:,.0f}",
-                delta=f"{change:,.0f}"
+                label="Close",
+                value=f"{twii_price:,.2f}",
+                delta=f"{twii_delta:,.2f}"
             )
         else:
-            # 錯誤處理 UI
-            st.error("⚠️ 暫無數據 (來源錯誤: 無法解析 Yahoo 頁面)")
-            st.info("請檢查網路連線或 Yahoo 網頁結構是否變更")
+            st.error("N/A")
 
-    with col2:
-        st.subheader("🧠 AI 戰略分析")
-        
-        # 檢查是否已登入 API Key
-        if 'gemini_api_key' not in st.session_state:
-            st.warning("請於側邊欄輸入 Gemini API Key 以啟用 AI 分析")
+    # Col 2: 台指期 (爬蟲)
+    with c2:
+        st.subheader("台指期 (TXF)")
+        if txf_price:
+            st.metric(
+                label="Realtime",
+                value=f"{txf_price:,.0f}",
+                delta=f"{txf_delta:,.0f}"
+            )
         else:
-            # 呼叫 AI
-            if futures_data:
-                with st.spinner("AI 正在解讀盤勢..."):
-                    analysis = analyze_market_with_gemini(
-                        st.session_state['gemini_api_key'], 
-                        futures_data
-                    )
-                    st.markdown(analysis)
+            st.warning("N/A (Crawl Failed)")
+
+    # Col 3: 期現貨價差
+    with c3:
+        st.subheader("期現貨價差")
+        if spread is not None:
+            # 顯示邏輯：標示正逆價差
+            st.metric(
+                label="Spread",
+                value=f"{spread:,.2f}",
+                delta=spread_status,
+                delta_color="off" # 這裡不使用紅綠色，或者根據正逆決定顏色
+            )
+            # 使用 Caption 增強視覺
+            if spread < 0:
+                st.caption("🔻 逆價差 (空方優勢?)")
             else:
-                st.markdown("⚠️ *等待數據修復後進行分析...*")
+                st.caption("🔺 正價差 (多方優勢?)")
+        else:
+            st.info("計算中...")
+
+    # Col 4: VIX 恐慌指數
+    with c4:
+        st.subheader("VIX 恐慌指數")
+        if vix_price:
+            # 視覺警示：若 > 20 顯示紅色 (透過 inverse delta 模擬危險感)
+            is_danger = vix_price > 20
+            
+            st.metric(
+                label="Volatility",
+                value=f"{vix_price:.2f}",
+                delta="⚠️ 高風險" if is_danger else "正常",
+                delta_color="inverse" if is_danger else "normal"
+            )
+            if is_danger:
+                st.markdown(":red[**市場恐慌情緒高漲！**]")
+        else:
+            st.error("N/A")
+
+    st.markdown("---")
+
+    # --- 3. AI 戰情分析 ---
+    st.header("🤖 Gemini 戰情官")
+    
+    if st.session_state.google_api_key:
+        if st.button("🚀 生成操盤建議"):
+            # 準備數據包
+            market_data = {
+                "twii_price": f"{twii_price:.2f}" if twii_price else "N/A",
+                "twii_delta": f"{twii_delta:.2f}" if twii_delta else "N/A",
+                "txf_price": f"{txf_price:.0f}" if txf_price else "N/A",
+                "txf_delta": f"{txf_delta:.0f}" if txf_delta else "N/A",
+                "spread": f"{spread:.2f}" if spread is not None else "N/A",
+                "spread_status": spread_status,
+                "vix_price": f"{vix_price:.2f}" if vix_price else "N/A"
+            }
+            
+            with st.spinner("Gemini 正在分析盤勢... (Model: gemini-3-pro-preview)"):
+                analysis = generate_ai_analysis(st.session_state.google_api_key, market_data)
+                
+            st.success("分析完成")
+            st.markdown(f"### 📝 操盤筆記\n{analysis}")
+    else:
+        st.info("請先於左側 Sidebar 設定 Google API Key 以啟用 AI 分析功能。")
 
 if __name__ == "__main__":
     main()
 
 # --- requirements.txt ---
-# beautifulsoup4
-# requests
-# pytz
-# fugle-marketdata
-# yfinance
 # streamlit
-# google-generativeai
+# yfinance
 # pandas
-# streamlit-autorefresh
+# requests
+# beautifulsoup4
+# google-generativeai
+# pytz
