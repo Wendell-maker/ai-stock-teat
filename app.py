@@ -360,9 +360,7 @@ st.caption("© 2024 AI Options Dashboard | Data Source: Yahoo Finance | Logic: T
 # pytz
 ```
 
-### 檔案 2: `requirements.txt`
-
-請將以下內容存為 `requirements.txt`，並執行 `pip install -r requirements.txt` 安裝所需套件。
+### 檔案 2: `requirements.txt
 
 ```text
 streamlit
