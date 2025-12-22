@@ -1,5 +1,5 @@
 streamlit
-google-generativeai
+google-genai
 fugle-marketdata
 yfinance
 streamlit-autorefresh
