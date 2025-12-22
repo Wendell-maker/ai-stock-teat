@@ -6,4 +6,4 @@ streamlit-autorefresh
 pandas
 numpy
 requests
-# force update 2025
+beautifulsoup4
