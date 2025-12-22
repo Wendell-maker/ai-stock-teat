@@ -4,323 +4,391 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
-import datetime
-import pytz
+import os
+from streamlit_autorefresh import st_autorefresh
 
-# --- 設定頁面配置 (必須是第一個 Streamlit 指令) ---
-st.set_page_config(
-    page_title="台股戰情室 AI Dashboard",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# --- 頁面設定與全域樣式 ---
+def configure_page():
+    """設定 Streamlit 頁面佈局與標題"""
+    st.set_page_config(
+        page_title="台股 AI 戰情室",
+        page_icon="📈",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # 注入 CSS 微調 (選擇性，優化卡片顯示)
+    st.markdown("""
+        <style>
+        .stMetric {
+            background-color: #f0f2f6;
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 1px 1px 3px rgba(0,0,0,0.1);
+        }
+        .st-emotion-cache-1r6slb0 {
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 15px;
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
-# --- 工具函式模組 ---
+# --- 數據抓取模組 ---
 
-def get_current_time_str() -> str:
+def get_yahoo_txf():
     """
-    取得目前台北時間字串。
-
+    抓取 Yahoo 股市台指期即時報價
+    
     Returns:
-        str: 格式化的時間字串 (YYYY-MM-DD HH:MM:SS)
+        tuple: (current_price (float), change_amount (float)) or (None, None) if failed
     """
-    tz = pytz.timezone('Asia/Taipei')
-    return datetime.datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')
-
-def get_yfinance_data(ticker: str):
-    """
-    使用 yfinance 抓取指定標的之最新報價與漲跌。
-
-    Args:
-        ticker (str): Yahoo Finance 的代號 (例如 ^TWII, ^VIX)
-
-    Returns:
-        tuple: (最新價格 float, 漲跌幅 float) 或 (None, None) 若失敗
-    """
-    try:
-        stock = yf.Ticker(ticker)
-        # 抓取最近 5 天以確保有資料 (考慮週末)
-        df = stock.history(period="5d")
-        if len(df) < 2:
-            # 若資料不足（例如剛開盤或假日），嘗試抓取當日
-            if len(df) == 1:
-                price = df['Close'].iloc[-1]
-                # 簡單計算，若沒有前一日資料則設 delta 為 0
-                delta = 0.0 
-                return price, delta
-            return None, None
-        
-        # 最新價
-        price = df['Close'].iloc[-1]
-        # 前一日收盤 (用於計算漲跌)
-        prev_close = df['Close'].iloc[-2]
-        delta = price - prev_close
-        
-        return price, delta
-    except Exception as e:
-        print(f"Error fetching {ticker}: {e}")
-        return None, None
-
-def get_txf_realtime_price() -> tuple:
-    """
-    [精準爬蟲] 從 Yahoo 股市抓取台指期 (WTX&) 即時報價。
-    針對 Yahoo 改版後的 CSS Class 進行定位。
-
-    Returns:
-        tuple: (最新價格 float, 漲跌點數 float) 或 (None, None) 若失敗
-    """
-    url = "https://tw.stock.yahoo.com/quote/WTX%26" # %26 代表連續月
+    url = "https://tw.stock.yahoo.com/quote/WTX%26"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     
     try:
         response = requests.get(url, headers=headers, timeout=5)
         response.raise_for_status()
-        
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 1. 抓取價格: 尋找 class 包含 "Fz(32px)" 的 span
-        # 這是 Yahoo 個股頁面顯示大字體價格的標準特徵
-        price_span = soup.find('span', class_=lambda x: x and 'Fz(32px)' in x)
+        # 根據 class 選擇器抓取 (依照用戶指定的 Fz(32px) 與 Fz(20px))
+        # 注意: Yahoo class 名稱常動態產生，但 Fz class 通常用於字體大小控制
+        price_span = soup.find('span', class_='Fz(32px)')
+        change_span = soup.find('span', class_='Fz(20px)')
         
-        # 2. 抓取漲跌: 尋找 class 包含 "Fz(20px)" 的 span
-        # 通常位於價格附近，或者是主要資訊區塊
-        # 注意：頁面上可能有多個 Fz(20px)，通常第一個跟在價格附近的是漲跌
-        change_span = soup.find('span', class_=lambda x: x and 'Fz(20px)' in x)
-
-        if price_span:
-            price_text = price_span.text.replace(',', '').strip()
-            price = float(price_text)
+        if price_span and change_span:
+            price = float(price_span.text.replace(',', ''))
             
-            delta = 0.0
-            if change_span:
-                # 處理漲跌文字，移除可能的特殊符號或百分比，這裡只抓點數
-                # Yahoo 的 HTML 結構通常漲跌點數是一個 span，百分比是另一個
-                change_text = change_span.text.replace(',', '').strip()
+            # 處理漲跌文字 (例如: "▲105" 或 "▼-20")
+            change_text = change_span.text.strip()
+            # 移除常見的箭頭符號或特殊字元
+            change_clean = change_text.replace('▲', '').replace('▼', '').replace(',', '')
+            
+            # 判斷正負 (有時 Yahoo 跌會帶負號，有時需看顏色 class，這裡嘗試直接轉型)
+            # 若原始文字包含 '-' 則為負，否則視為正 (或根據箭頭邏輯)
+            change = float(change_clean)
+            if '▼' in change_text or (change > 0 and '▼' in change_text): 
+                change = -abs(change)
+            elif '▲' in change_text:
+                change = abs(change)
                 
-                # 嘗試解析，如果包含 % 則可能抓錯了，但在 Yahoo 的 header 結構中，
-                # 第一個 Fz(20px) 通常是點數變化，第二個才是百分比
-                if '%' not in change_text:
-                    # 處理 '▽', '▲' 或其他符號
-                    try:
-                        delta = float(change_text)
-                    except ValueError:
-                        # 若無法直接轉 float，嘗試過濾非數字字符 (保留負號與小數點)
-                        import re
-                        clean_num = re.findall(r"[-+]?\d*\.\d+|\d+", change_text)
-                        if clean_num:
-                            delta = float(clean_num[0])
-                            # 檢查顏色類別判斷正負 (Yahoo 漲是紅色/C($c-trend-up), 跌是綠色/C($c-trend-down))
-                            # 這裡簡單透過 context 判斷，若無負號則假設
-                            pass 
-            
-            # Yahoo 有時漲跌會帶有三角形符號，導致 float 轉換失敗，需更嚴謹處理
-            # 若上方抓取失敗，回傳 0.0
-            return price, delta
+            return price, change
         else:
             return None, None
             
     except Exception as e:
-        print(f"Crawler Error: {e}")
+        print(f"Yahoo Scraping Error: {e}")
         return None, None
 
-def generate_ai_analysis(api_key: str, market_data: dict) -> str:
+def get_realtime_data(ticker):
     """
-    呼叫 Google Gemini API 生成市場分析建議。
-
+    使用 yfinance 獲取即時(或延遲)報價
+    
     Args:
-        api_key (str): Google GenAI API Key
-        market_data (dict): 包含各項指標的字典
-
+        ticker (str): 股票代號
+        
     Returns:
-        str: AI 生成的分析文字
+        dict: 包含 'price', 'change', 'volume' 的字典
     """
     try:
+        stock = yf.Ticker(ticker)
+        # 嘗試獲取今日數據，若無則取最近一日
+        df = stock.history(period="1d")
+        
+        if df.empty:
+            # 有時候盤前盤後需抓取最近 5 天確保有資料
+            df = stock.history(period="5d")
+        
+        if not df.empty:
+            last_close = df['Close'].iloc[-1]
+            volume = df['Volume'].iloc[-1]
+            
+            # 取得前一日收盤價以計算漲跌
+            prev_close = stock.info.get('previousClose')
+            if prev_close is None and len(df) >= 2:
+                prev_close = df['Close'].iloc[-2]
+            elif prev_close is None:
+                prev_close = last_close # Fallback
+                
+            change = last_close - prev_close
+            
+            return {
+                "price": last_close,
+                "change": change,
+                "volume": volume,
+                "prev_close": prev_close
+            }
+    except Exception as e:
+        print(f"Yfinance Error ({ticker}): {e}")
+    
+    return {"price": 0, "change": 0, "volume": 0, "prev_close": 0}
+
+def get_tech_indicators(ticker_symbol="^TWII"):
+    """
+    計算技術指標 (RSI, MA)
+    
+    Args:
+        ticker_symbol (str): 標的代號
+    
+    Returns:
+        dict: 包含 'rsi', 'ma5', 'ma20', 'last_price'
+    """
+    stock = yf.Ticker(ticker_symbol)
+    df = stock.history(period="3mo") # 過去 60 天以上數據
+    
+    if df.empty:
+        return {}
+    
+    # 計算 MA
+    df['MA5'] = df['Close'].rolling(window=5).mean()
+    df['MA20'] = df['Close'].rolling(window=20).mean()
+    
+    # 計算 RSI (簡易版: Rolling Mean)
+    # 標準 RSI 使用 EMA，但此處依需求使用 Rolling Mean
+    delta = df['Close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    window_length = 14
+    avg_gain = gain.rolling(window=window_length).mean()
+    avg_loss = loss.rolling(window=window_length).mean()
+    
+    rs = avg_gain / avg_loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # 取最新一筆非 NaN 的數據
+    last_row = df.iloc[-1]
+    
+    return {
+        "rsi": last_row['RSI'],
+        "ma5": last_row['MA5'],
+        "ma20": last_row['MA20'],
+        "close": last_row['Close']
+    }
+
+def call_ai_analysis(api_key, context_text, model_name="gemini-3-pro-preview"):
+    """
+    呼叫 Google Gemini API 進行分析
+    """
+    if not api_key:
+        return "⚠️ 請先於左側欄位設定 Google AI API Key"
+        
+    try:
         genai.configure(api_key=api_key)
-        # 依照需求指定使用 gemini-3-pro-preview
-        # 注意：若該模型尚未對所有帳號開放，可改回 gemini-1.5-pro
-        model = genai.GenerativeModel('gemini-3-pro-preview')
+        # 註: 使用者指定 'gemini-3-pro-preview'，若 SDK 不支援可能需降級為 'gemini-1.5-pro'
+        # 此處依照需求設定，若報錯請檢查模型名稱有效性
+        model = genai.GenerativeModel(model_name)
         
         prompt = f"""
-        你是一位專業的華爾街量化交易員。請根據以下台北股市即時數據進行簡短且精準的分析。
-
+        你是一位專業的華爾街交易員與量化分析師。請根據以下台股與美股的即時數據，
+        提供一份簡短精確的市場分析報告（繁體中文）。
+        
         【市場數據】
-        1. 加權指數 (TWII): {market_data.get('twii_price', 'N/A')} (漲跌: {market_data.get('twii_delta', 'N/A')})
-        2. 台指期 (TXF): {market_data.get('txf_price', 'N/A')} (漲跌: {market_data.get('txf_delta', 'N/A')})
-        3. 期現貨價差 (Spread): {market_data.get('spread', 'N/A')} ({market_data.get('spread_status', 'N/A')})
-        4. VIX 恐慌指數: {market_data.get('vix_price', 'N/A')}
-
-        【任務】
-        請提供一段約 150 字的操盤建議。
-        重點分析：價差是否異常（正逆價差過大）、VIX 是否顯示恐慌、以及短線多空方向。
-        請使用繁體中文，語氣專業冷靜。
+        {context_text}
+        
+        【分析要求】
+        1. 解讀台指期與加權指數的價差意義（多空力道）。
+        2. 點評 VIX 恐慌指數的水位。
+        3. 結合台積電與 NVIDIA 表現，預判 AI 板塊走勢。
+        4. 根據 TWII 技術指標 (RSI, MA) 給出短線操作建議。
+        5. 風格精簡有力，直接給出結論。
         """
         
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"AI 分析生成失敗: {str(e)}\n(請檢查 API Key 或模型權限)"
-
-# --- UI 介面模組 ---
-
-def render_sidebar():
-    """渲染側邊欄：API Key 設定與通知"""
-    with st.sidebar:
-        st.header("⚙️ 設定中心")
-        
-        # API Key 管理
-        if "google_api_key" not in st.session_state:
-            st.session_state.google_api_key = ""
-        
-        with st.expander("🔑 Google AI Key", expanded=not bool(st.session_state.google_api_key)):
-            key_input = st.text_input("輸入 Gemini API Key", type="password", key="input_api_key")
-            if st.button("儲存 Key"):
-                st.session_state.google_api_key = key_input
-                st.rerun()
+        with st.spinner("🤖 AI 正在分析市場數據中..."):
+            response = model.generate_content(prompt)
+            return response.text
             
-            if st.session_state.google_api_key:
-                st.success("已登入 (API Key Set)")
-                if st.button("登出 / 清除 Key"):
-                    st.session_state.google_api_key = ""
-                    st.rerun()
+    except Exception as e:
+        return f"❌ AI 分析失敗: {str(e)}"
 
-        # Telegram 通知 (模擬 UI，僅做 Session 保存)
-        st.markdown("---")
-        with st.expander("📢 Telegram 通知設定"):
-            st.text_input("Bot Token", key="tg_token")
-            st.text_input("Chat ID", key="tg_chat_id")
-            st.checkbox("啟用自動推播", key="tg_enable")
-            if st.button("測試發送"):
-                st.toast("測試訊息已發送 (模擬)", icon="🚀")
+# --- 主程式 ---
 
 def main():
-    """主程式入口"""
-    render_sidebar()
+    configure_page()
     
-    st.title("📊 台股戰情室 (AI Powered)")
-    st.markdown(f"Update Time: `{get_current_time_str()}`")
-    
-    # 手動刷新按鈕
-    if st.button("🔄 刷新數據"):
-        st.rerun()
+    # --- Sidebar ---
+    with st.sidebar:
+        st.header("⚙️ 系統設定")
+        api_key = st.text_input("Gemini API Key", type="password", placeholder="Enter your key here")
+        
+        with st.expander("📲 Telegram 通知設定"):
+            st.text_input("Bot Token")
+            st.text_input("Chat ID")
+        
+        st.markdown("---")
+        auto_refresh = st.toggle("開啟自動監控 (每分鐘)", key="auto_monitoring")
+        
+        if auto_refresh:
+            st_autorefresh(interval=60000, key="data_refresh")
+            st.caption("✅ 自動更新啟用中")
 
+    st.title("📊 台股戰情室 (Market Dashboard)")
     st.markdown("---")
 
     # --- 1. 數據獲取 ---
-    # 建立 Loading 提示
-    with st.spinner('正在從 Yahoo Finance 與交易所抓取數據...'):
-        # Col 1: TWII
-        twii_price, twii_delta = get_yfinance_data("^TWII")
-        
-        # Col 2: TXF (Custom Crawler)
-        txf_price, txf_delta = get_txf_realtime_price()
-        
-        # Col 3: Spread Calculation
-        spread = None
-        spread_status = "N/A"
-        if twii_price is not None and txf_price is not None:
-            spread = txf_price - twii_price
-            if spread > 0:
-                spread_status = "正價差"
-            elif spread < 0:
-                spread_status = "逆價差"
-            else:
-                spread_status = "平價"
-        
-        # Col 4: VIX
-        vix_price, vix_delta = get_yfinance_data("^VIX")
+    # TWII
+    twii_data = get_realtime_data("^TWII")
+    # TXF (Yahoo)
+    txf_price, txf_change = get_yahoo_txf()
+    # VIX
+    vix_data = get_realtime_data("^VIX")
+    # Key Stocks
+    tsmc_data = get_realtime_data("2330.TW")
+    nvda_data = get_realtime_data("NVDA")
+    # Tech Indicators
+    tech_data = get_tech_indicators("^TWII")
 
-    # --- 2. 介面佈局重構 (Dashboard UI) ---
-    # 建立四欄佈局
+    # --- 2. 頂部四欄關鍵指標 ---
     c1, c2, c3, c4 = st.columns(4)
 
-    # Col 1: 加權指數
+    # C1: 加權指數
     with c1:
-        st.subheader("加權指數 (TWII)")
-        if twii_price:
-            st.metric(
-                label="Close",
-                value=f"{twii_price:,.2f}",
-                delta=f"{twii_delta:,.2f}"
-            )
-        else:
-            st.error("N/A")
+        st.metric(
+            label="加權指數 (TWII)",
+            value=f"{twii_data['price']:,.0f}",
+            delta=f"{twii_data['change']:.0f}"
+        )
 
-    # Col 2: 台指期 (爬蟲)
+    # C2: 台指期 (Yahoo Scraped)
     with c2:
-        st.subheader("台指期 (TXF)")
-        if txf_price:
+        if txf_price is not None:
             st.metric(
-                label="Realtime",
+                label="台指期 (TXF)",
                 value=f"{txf_price:,.0f}",
-                delta=f"{txf_delta:,.0f}"
+                delta=f"{txf_change:.0f}"
             )
         else:
-            st.warning("N/A (Crawl Failed)")
+            st.metric(label="台指期 (TXF)", value="N/A", delta="爬蟲失敗", delta_color="off")
 
-    # Col 3: 期現貨價差
+    # C3: 期現貨價差
     with c3:
-        st.subheader("期現貨價差")
-        if spread is not None:
-            # 顯示邏輯：標示正逆價差
-            st.metric(
-                label="Spread",
-                value=f"{spread:,.2f}",
-                delta=spread_status,
-                delta_color="off" # 這裡不使用紅綠色，或者根據正逆決定顏色
-            )
-            # 使用 Caption 增強視覺
-            if spread < 0:
-                st.caption("🔻 逆價差 (空方優勢?)")
-            else:
-                st.caption("🔺 正價差 (多方優勢?)")
-        else:
-            st.info("計算中...")
-
-    # Col 4: VIX 恐慌指數
-    with c4:
-        st.subheader("VIX 恐慌指數")
-        if vix_price:
-            # 視覺警示：若 > 20 顯示紅色 (透過 inverse delta 模擬危險感)
-            is_danger = vix_price > 20
+        if txf_price is not None and twii_data['price'] > 0:
+            spread = txf_price - twii_data['price']
+            
+            # UI 邏輯: 負價差顯示為紅色 (inverse 對應 logic: 正=綠, 負=紅)
+            # 在 Streamlit metric 中:
+            # delta_color="normal" (預設): 正數綠色, 負數紅色
+            # delta_color="inverse": 正數紅色, 負數綠色
+            # 題目要求: 逆價差(<0) 要有警訊(紅色)。
+            # 若使用 normal: -50 會變紅 (符合警示)。
+            # 若使用 inverse: -50 會變綠 (不符合警示)。
+            # 因此這裡使用自定義邏輯來顯示文字，顏色使用 normal 確保負數為紅。
+            
+            spread_label = "正價差 (多方)" if spread >= 0 else "逆價差 (空方)"
             
             st.metric(
-                label="Volatility",
-                value=f"{vix_price:.2f}",
-                delta="⚠️ 高風險" if is_danger else "正常",
-                delta_color="inverse" if is_danger else "normal"
+                label=f"期現貨價差 ({spread_label})",
+                value=f"{spread:.0f}",
+                delta=f"{spread:.0f}",
+                delta_color="normal" # 保持負數為紅色 (符合直覺與警示)
             )
-            if is_danger:
-                st.markdown(":red[**市場恐慌情緒高漲！**]")
         else:
-            st.error("N/A")
+            st.metric(label="期現貨價差", value="--")
+
+    # C4: VIX 恐慌指數
+    with c4:
+        vix_val = vix_data['price']
+        # 若 > 20 顯示紅色警示 (利用 delta_color="inverse" 讓正值變紅，如果不設 delta 則無法變色)
+        # 這裡我們用 trick: 設 delta 為正值且 inverse -> 紅色
+        delta_val = vix_val - 20 
+        label_suffix = "⚠️ 高風險" if vix_val > 20 else "穩定"
+        
+        st.metric(
+            label=f"VIX 恐慌指數 ({label_suffix})",
+            value=f"{vix_val:.2f}",
+            delta=f"{vix_data['change']:.2f}",
+            delta_color="inverse" # VIX 漲是壞事，所以用 inverse (漲紅/跌綠)
+        )
 
     st.markdown("---")
 
-    # --- 3. AI 戰情分析 ---
-    st.header("🤖 Gemini 戰情官")
-    
-    if st.session_state.google_api_key:
-        if st.button("🚀 生成操盤建議"):
-            # 準備數據包
-            market_data = {
-                "twii_price": f"{twii_price:.2f}" if twii_price else "N/A",
-                "twii_delta": f"{twii_delta:.2f}" if twii_delta else "N/A",
-                "txf_price": f"{txf_price:.0f}" if txf_price else "N/A",
-                "txf_delta": f"{txf_delta:.0f}" if txf_delta else "N/A",
-                "spread": f"{spread:.2f}" if spread is not None else "N/A",
-                "spread_status": spread_status,
-                "vix_price": f"{vix_price:.2f}" if vix_price else "N/A"
-            }
+    # --- 3. 底部雙欄配置 ---
+    col_left, col_right = st.columns(2)
+
+    # 左欄：重點個股
+    with col_left:
+        st.subheader("### 護國神山與 AI 龍頭")
+        sc1, sc2 = st.columns(2)
+        
+        with sc1:
+            st.markdown("**台積電 (2330.TW)**")
+            st.metric(
+                label="Price",
+                value=f"{tsmc_data['price']:.0f}",
+                delta=f"{tsmc_data['change']:.1f}"
+            )
+            st.caption(f"Vol: {tsmc_data['volume']/1000:.1f}K")
             
-            with st.spinner("Gemini 正在分析盤勢... (Model: gemini-3-pro-preview)"):
-                analysis = generate_ai_analysis(st.session_state.google_api_key, market_data)
-                
-            st.success("分析完成")
-            st.markdown(f"### 📝 操盤筆記\n{analysis}")
-    else:
-        st.info("請先於左側 Sidebar 設定 Google API Key 以啟用 AI 分析功能。")
+        with sc2:
+            st.markdown("**NVIDIA (NVDA)**")
+            st.metric(
+                label="Price",
+                value=f"{nvda_data['price']:.2f}",
+                delta=f"{nvda_data['change']:.2f}"
+            )
+            st.caption(f"Vol: {nvda_data['volume']/1000000:.1f}M")
+
+    # 右欄：技術指標
+    with col_right:
+        st.subheader("### 技術指標 (TWII 加權指數)")
+        
+        if tech_data:
+            ic1, ic2, ic3 = st.columns(3)
+            
+            # RSI
+            rsi_val = tech_data.get('rsi', 50)
+            rsi_status = "過熱" if rsi_val > 70 else "超賣" if rsi_val < 30 else "中性"
+            rsi_color = "inverse" if rsi_val > 70 else "normal" # >70 紅色警示
+            
+            with ic1:
+                st.metric(
+                    label=f"RSI (14) - {rsi_status}",
+                    value=f"{rsi_val:.1f}",
+                    delta=rsi_val - 50, # 與中線比較
+                    delta_color="off" # 不顯示顏色以免混淆，或自行定義
+                )
+            
+            # MA5
+            with ic2:
+                ma5 = tech_data.get('ma5', 0)
+                price = tech_data.get('close', 0)
+                st.metric(
+                    label="MA (5日)",
+                    value=f"{ma5:.0f}",
+                    delta=f"{price - ma5:.0f} (乖離)",
+                )
+
+            # MA20
+            with ic3:
+                ma20 = tech_data.get('ma20', 0)
+                st.metric(
+                    label="MA (20日)",
+                    value=f"{ma20:.0f}",
+                    delta=f"{price - ma20:.0f} (乖離)",
+                )
+        else:
+            st.warning("無法取得足夠歷史數據計算指標")
+
+    # --- 4. AI 戰情分析 ---
+    st.markdown("---")
+    st.subheader("🤖 AI 戰情分析官 (Gemini)")
+    
+    if st.button("生成今日市場報告"):
+        # 準備 Context
+        context = f"""
+        [加權指數] {twii_data['price']} (漲跌: {twii_data['change']})
+        [台指期] {txf_price if txf_price else 'N/A'} (漲跌: {txf_change if txf_change else 'N/A'})
+        [價差] {txf_price - twii_data['price'] if txf_price else 'N/A'}
+        [VIX] {vix_data['price']}
+        [台積電] {tsmc_data['price']}
+        [NVIDIA] {nvda_data['price']}
+        [技術指標] RSI: {tech_data.get('rsi', 'N/A')}, MA5: {tech_data.get('ma5', 'N/A')}, MA20: {tech_data.get('ma20', 'N/A')}
+        """
+        
+        analysis_result = call_ai_analysis(api_key, context)
+        st.info(analysis_result)
 
 if __name__ == "__main__":
     main()
@@ -328,8 +396,8 @@ if __name__ == "__main__":
 # --- requirements.txt ---
 # streamlit
 # yfinance
-# pandas
 # requests
 # beautifulsoup4
+# pandas
 # google-generativeai
-# pytz
+# streamlit-autorefresh
