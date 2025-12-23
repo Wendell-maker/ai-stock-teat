@@ -1,277 +1,281 @@
 import streamlit as st
 import yfinance as yf
-import requests
 import pandas as pd
-import numpy as np
+import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
 from streamlit_autorefresh import st_autorefresh
-import json
+import datetime
 
-# --- 頁面設定與樣式注入 ---
+# --- 樣式與設定模組 ---
 
-st.set_page_config(
-    layout="wide", 
-    page_title="台股 AI 戰情室", 
-    page_icon="📈"
-)
-
-# 強制深色模式 CSS 注入
-st.markdown(
+def apply_custom_style():
     """
-    <style>
-    /* 強制背景深色，文字淺色 */
-    .stApp {
-        background-color: #0E1117;
-        color: #FAFAFA;
-    }
-    /* 調整 Metric 指標的可讀性 */
-    [data-testid="stMetricLabel"] {
-        color: #B0B0B0 !important;
-    }
-    [data-testid="stMetricValue"] {
-        color: #FFFFFF !important;
-    }
-    /* 調整表格文字 */
-    div[data-testid="stTable"] {
-        color: #FAFAFA;
-    }
-    /* 隱藏預設 Markdown 標題後的線條 */
-    hr {
-        margin-top: 1rem;
-        margin-bottom: 1rem;
-        border-color: #31333F;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+    強制注入 CSS 樣式以確保深色模式 (Dark Mode) 下的文字與背景對比度。
+    """
+    st.markdown(
+        """
+        <style>
+            /* 強制背景深色，文字淺色 */
+            .stApp {
+                background-color: #0E1117;
+                color: #FAFAFA;
+            }
+            /* 調整 Metric 指標的可讀性 */
+            [data-testid="stMetricLabel"] {
+                color: #B0B0B0 !important;
+            }
+            [data-testid="stMetricValue"] {
+                color: #FFFFFF !important;
+            }
+            /* 調整表格文字 */
+            div[data-testid="stTable"] {
+                color: #FAFAFA;
+            }
+            /* 去除所有 Markdown 可能產生的預設邊距 */
+            .main .block-container {
+                padding-top: 2rem;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
 
 # --- 數據抓取模組 ---
 
-def fetch_txf_data():
+def get_txf_data():
     """
-    爬取 Yahoo 財經之台指期近月數據。
+    爬取 Yahoo 財經台指期貨近月數據。
     
-    Returns:
-        dict: 包含 'price' 與 'change' 的字典，失敗則回傳 None。
+    回傳:
+        tuple: (price, change_pct) 若成功，否則 (None, None)
     """
     url = "https://tw.stock.yahoo.com/quote/WTX%26"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, "html.parser")
+        resp = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(resp.text, 'html.parser')
         
-        # 抓取價格與漲跌 (使用指定 Selector)
+        # 尋找價格 (Fz(32px)) 與 漲跌幅 (Fz(20px))
         price_tag = soup.find("span", class_="Fz(32px)")
         change_tag = soup.find("span", class_="Fz(20px)")
         
-        if price_tag:
-            price_val = price_tag.text.replace(",", "")
-            change_val = change_tag.text if change_tag else "0"
-            return {"price": float(price_val), "change": change_val}
+        if price_tag and change_tag:
+            price = float(price_tag.text.replace(',', ''))
+            change = change_tag.text
+            return price, change
     except Exception as e:
-        print(f"TXF 爬取錯誤: {e}")
-    return None
+        print(f"TXF Scraping Error: {e}")
+    return None, None
 
-def fetch_market_data(ticker_symbol):
+def get_market_data():
     """
-    使用 yfinance 抓取市場數據。
+    使用 yfinance 抓取關鍵市場數據。
     
-    Args:
-        ticker_symbol (str): 股票代碼 (e.g., '^TWII')。
-        
-    Returns:
-        tuple: (最新價, 漲跌額, 歷史 DataFrame)
+    回傳:
+        dict: 包含各項標的之收盤價與漲跌。
+    """
+    tickers = {
+        "TWII": "^TWII",      # 加權指數
+        "TSMC": "2330.TW",    # 台積電
+        "NVDA": "NVDA",       # NVIDIA
+        "VIX": "^VIX"         # VIX 指數
+    }
+    
+    results = {}
+    for key, symbol in tickers.items():
+        try:
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="2d")
+            if len(hist) >= 2:
+                close = hist['Close'].iloc[-1]
+                prev_close = hist['Close'].iloc[-2]
+                change = close - prev_close
+                change_pct = (change / prev_close) * 100
+                results[key] = {
+                    "price": round(close, 2),
+                    "change": round(change, 2),
+                    "pct": round(change_pct, 2)
+                }
+            else:
+                results[key] = {"price": 0, "change": 0, "pct": 0}
+        except:
+            results[key] = {"price": 0, "change": 0, "pct": 0}
+    return results
+
+def calculate_indicators(symbol="^TWII"):
+    """
+    計算技術指標 RSI, MA。
+    
+    參數:
+        symbol (str): 標的代碼。
+    回傳:
+        dict: 包含 RSI14, MA5, MA20。
     """
     try:
-        ticker = yf.Ticker(ticker_symbol)
-        df = ticker.history(period="1mo")
-        if df.empty:
-            return None, None, None
+        df = yf.download(symbol, period="2mo", interval="1d", progress=False)
+        # RSI 14
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
         
-        latest_price = df['Close'].iloc[-1]
-        prev_price = df['Close'].iloc[-2]
-        change = latest_price - prev_price
-        return latest_price, change, df
-    except Exception:
-        return None, None, None
-
-def calculate_technical_indicators(df):
-    """
-    計算常用技術指標。
-    
-    Args:
-        df (pd.DataFrame): 包含 'Close' 欄位的數據。
+        # MA
+        ma5 = df['Close'].rolling(window=5).mean()
+        ma20 = df['Close'].rolling(window=20).mean()
         
-    Returns:
-        dict: 包含 RSI, MA5, MA20 的字典。
-    """
-    if df is None or len(df) < 20:
-        return {"RSI": 0, "MA5": 0, "MA20": 0}
-    
-    close = df['Close']
-    
-    # MA 計算
-    ma5 = close.rolling(window=5).mean().iloc[-1]
-    ma20 = close.rolling(window=20).mean().iloc[-1]
-    
-    # RSI 計算 (簡化版)
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs.iloc[-1]))
-    
-    return {"RSI": round(rsi, 2), "MA5": round(ma5, 2), "MA20": round(ma20, 2)}
+        return {
+            "rsi": round(rsi.iloc[-1], 2),
+            "ma5": round(ma5.iloc[-1], 2),
+            "ma20": round(ma20.iloc[-1], 2)
+        }
+    except:
+        return {"rsi": 0, "ma5": 0, "ma20": 0}
 
-# --- 通訊模組 ---
+# --- 通知模組 ---
 
 def send_telegram_msg(token, chat_id, message):
     """
     發送 Telegram 訊息。
     
-    Args:
-        token (str): Bot Token.
+    參數:
+        token (str): Bot API Token.
         chat_id (str): Chat ID.
-        message (str): 訊息內容。
+        message (str): 要發送的文字內容。
     """
+    if not token or not chat_id:
+        return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message}
     try:
-        res = requests.post(url, data=payload)
-        return res.status_code == 200
-    except Exception:
+        resp = requests.post(url, json=payload, timeout=5)
+        return resp.status_code == 200
+    except:
         return False
 
-# --- 側邊欄設定 ---
+# --- 主程式進入點 ---
 
-with st.sidebar:
-    st.title("⚙️ 系統設定")
-    gemini_key = st.text_input("Gemini API Key", type="password")
+def main():
+    # 設定頁面
+    st.set_page_config(layout="wide", page_title="台股 AI 戰情室", page_icon="📈")
+    apply_custom_style()
+
+    # --- Sidebar 設定區 ---
+    st.sidebar.title("控制面板")
+    gemini_key = st.sidebar.text_input("Gemini API Key", type="password")
     
-    with st.expander("Telegram 通知設定"):
-        tg_token = st.text_input("Bot Token", type="password")
-        tg_chat_id = st.text_input("Chat ID")
-        if st.button("測試連線"):
-            if tg_token and tg_chat_id:
-                success = send_telegram_msg(tg_token, tg_chat_id, "🔔 戰情室連線測試成功！")
-                if success: st.success("測試訊息已發送")
-                else: st.error("發送失敗，請檢查設定")
+    with st.sidebar.expander("Telegram 通知設定"):
+        tg_token = st.sidebar.text_input("Bot Token", type="password")
+        tg_chat_id = st.sidebar.text_input("Chat ID")
+        if st.sidebar.button("測試連線"):
+            success = send_telegram_msg(tg_token, tg_chat_id, "🚀 台股戰情室：連線測試成功！")
+            if success:
+                st.sidebar.success("發送成功")
             else:
-                st.warning("請填寫完整的 Token 與 ID")
-    
-    auto_monitor = st.toggle("開啟自動監控 (每分鐘)", key="auto_monitoring")
-    if auto_monitor:
+                st.sidebar.error("發送失敗，請檢查設定")
+
+    auto_on = st.sidebar.toggle("開啟自動監控 (每分鐘)", key="auto_monitoring")
+    if auto_on:
         st_autorefresh(interval=60000, key="datarefresh")
 
-# --- 主程式邏輯 ---
+    # --- 數據抓取 ---
+    m_data = get_market_data()
+    txf_price, txf_change = get_txf_data()
+    indicators = calculate_indicators("^TWII")
 
-# 1. 抓取數據
-twii_price, twii_change, twii_df = fetch_market_data("^TWII")
-txf_data = fetch_txf_data()
-vix_price, vix_change, _ = fetch_market_data("^VIX")
-tsmc_price, tsmc_change, _ = fetch_market_data("2330.TW")
-nvda_price, nvda_change, _ = fetch_market_data("NVDA")
+    # --- A. 頂部四欄關鍵指標 ---
+    col1, col2, col3, col4 = st.columns(4)
 
-# 2. 顯示頂部指標
-col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("加權指數 (TWII)", 
+                  f"{m_data['TWII']['price']:,}", 
+                  f"{m_data['TWII']['change']} ({m_data['TWII']['pct']}%)")
 
-with col1:
-    if twii_price:
-        st.metric("加權指數 (TWII)", f"{twii_price:.2f}", f"{twii_change:+.2f}")
-    else:
-        st.metric("加權指數 (TWII)", "N/A")
+    with col2:
+        if txf_price:
+            st.metric("台指期貨 (TXF)", f"{txf_price:,}", txf_change)
+        else:
+            st.metric("台指期貨 (TXF)", "抓取失敗", "N/A")
 
-with col2:
-    if txf_data:
-        st.metric("台指期 (TXF)", f"{txf_data['price']:.0f}", f"{txf_data['change']}")
-    else:
-        st.metric("台指期 (TXF)", "N/A")
+    with col3:
+        if txf_price:
+            spread = txf_price - m_data['TWII']['price']
+            # 正價差顯示綠色(normal)，逆價差顯示紅色(inverse)
+            color_mode = "normal" if spread >= 0 else "inverse"
+            st.metric("期現貨價差", f"{round(spread, 2)}", f"{'正價差' if spread >= 0 else '逆價差'}", delta_color=color_mode)
+        else:
+            st.metric("期現貨價差", "N/A", "N/A")
 
-with col3:
-    if txf_data and twii_price:
-        spread = txf_data['price'] - twii_price
-        # 正價差綠色(正常表現)，逆價差紅色
-        st.metric("期現貨價差", f"{spread:.2f}", f"{'正價差' if spread > 0 else '逆價差'}", delta_color="normal" if spread > 0 else "inverse")
-    else:
-        st.metric("期現貨價差", "N/A")
+    with col4:
+        vix_val = m_data['VIX']['price']
+        vix_color = "inverse" if vix_val > 20 else "normal"
+        st.metric("VIX 恐慌指數", f"{vix_val}", f"{m_data['VIX']['pct']}%", delta_color=vix_color)
 
-with col4:
-    if vix_price:
-        # VIX > 20 通常代表市場恐慌，顯示紅色
-        st.metric("VIX 恐慌指數", f"{vix_price:.2f}", f"{vix_change:+.2f}", delta_color="inverse" if vix_price > 20 else "normal")
-    else:
-        st.metric("VIX 指數", "N/A")
+    st.markdown("---")
 
-st.markdown("---")
+    # --- B. 底部雙欄配置 ---
+    left_col, right_col = st.columns(2)
 
-# 3. 底部細節配置
-left_col, right_col = st.columns(2)
+    with left_col:
+        st.subheader("護國神山與 AI 龍頭")
+        # 顯示台積電與 NVIDIA
+        sub_col1, sub_col2 = st.columns(2)
+        sub_col1.metric("台積電 (2330)", f"{m_data['TSMC']['price']}", f"{m_data['TSMC']['pct']}%")
+        sub_col2.metric("NVIDIA (NVDA)", f"${m_data['NVDA']['price']}", f"{m_data['NVDA']['pct']}%")
 
-with left_col:
-    st.subheader("護國神山與 AI 龍頭")
-    sub_l1, sub_l2 = st.columns(2)
-    with sub_l1:
-        if tsmc_price:
-            st.metric("台積電 (2330)", f"{tsmc_price:.1f}", f"{tsmc_change:+.1f}")
-    with sub_l2:
-        if nvda_price:
-            st.metric("NVIDIA (NVDA)", f"${nvda_price:.2f}", f"{nvda_change:+.2f}")
+    with right_col:
+        st.subheader("技術指標 (TWII)")
+        ind_col1, ind_col2, ind_col3 = st.columns(3)
+        ind_col1.metric("RSI (14)", indicators['rsi'])
+        ind_col2.metric("5日均線 (MA5)", f"{indicators['ma5']:,}")
+        ind_col3.metric("20日均線 (MA20)", f"{indicators['ma20']:,}")
 
-with right_col:
-    st.subheader("技術指標 (TWII)")
-    indicators = calculate_technical_indicators(twii_df)
-    ind_c1, ind_c2, ind_c3 = st.columns(3)
-    ind_c1.metric("RSI (14)", indicators["RSI"])
-    ind_c2.metric("MA 5", f"{indicators['MA5']:.0f}")
-    ind_c3.metric("MA 20", f"{indicators['MA20']:.0f}")
-
-st.markdown("---")
-
-# 4. AI 戰情解讀區塊
-st.subheader("🤖 AI 戰情即時解讀")
-
-if st.button("執行 AI 市場分析"):
-    if not gemini_key:
-        st.warning("請先於側邊欄輸入 Gemini API Key")
-    else:
-        try:
-            client = genai.Client(api_key=gemini_key)
-            
-            # 彙整數據
-            analysis_payload = {
-                "TWII": twii_price,
-                "TXF": txf_data['price'] if txf_data else None,
-                "Spread": (txf_data['price'] - twii_price) if (txf_data and twii_price) else None,
-                "VIX": vix_price,
-                "Indicators": indicators,
-                "Stocks": {"TSMC": tsmc_price, "NVDA": nvda_price}
-            }
-            
-            prompt = f"""
-            你是一位資深的台股分析師。請根據以下市場數據，提供簡短、精闢且具前瞻性的戰情解讀。
-            數據內容：{json.dumps(analysis_payload)}
-            請包含：
-            1. 當前盤勢短評
-            2. 期現貨價差所隱含的訊號
-            3. 建議關注的壓力或支撐位
-            請以條列式回答，語氣專業且精簡。
-            """
-            
-            response = client.models.generate_content(
-                model='gemini-3-flash-preview',
-                contents=prompt
-            )
-            
-            st.info(response.text)
-            
-            # 若有 Telegram 設定，同步發送分析報告
-            if tg_token and tg_chat_id:
-                send_telegram_msg(tg_token, tg_chat_id, f"📌 AI 戰情速報：\n{response.text}")
+    # --- AI 分析區塊 ---
+    st.markdown("---")
+    st.subheader("AI 戰情分析")
+    
+    if gemini_key:
+        if st.button("執行 AI 市場解讀"):
+            try:
+                genai.configure(api_key=gemini_key)
+                # 使用要求的模型版本，若失效請改為 'gemini-1.5-flash'
+                model = genai.GenerativeModel('gemini-1.5-flash')
                 
-        except Exception as e:
-            st.error(f"AI 分析失敗: {str(e)}")
+                analysis_data = {
+                    "Market": m_data,
+                    "TXF": {"price": txf_price, "change": txf_change},
+                    "Indicators": indicators,
+                    "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                
+                prompt = f"""
+                你是一位專業的台股分析師，請根據以下數據進行簡短有力的戰情分析：
+                {analysis_data}
+                
+                請針對以下重點分析：
+                1. 盤勢當前強弱。
+                2. 期現貨價差代表的市場情緒。
+                3. 技術指標 (RSI/MA) 的短線啟示。
+                4. 給投資者的建議。
+                請直接回傳分析報告，不要使用 Markdown 標題符號。
+                """
+                
+                with st.spinner("AI 正在思考中..."):
+                    response = model.generate_content(prompt)
+                    st.write(response.text)
+                    
+                    # 若 Telegram 已設定，同步發送
+                    if tg_token and tg_chat_id:
+                        send_telegram_msg(tg_token, tg_chat_id, f"【AI 戰情解讀】\n{response.text}")
+                        
+            except Exception as e:
+                st.error(f"AI 分析失敗: {str(e)}")
+    else:
+        st.info("請在側邊欄輸入 Gemini API Key 以啟用 AI 分析功能。")
+
+if __name__ == "__main__":
+    main()
 
 # --- requirements.txt ---
 # streamlit
@@ -279,6 +283,5 @@ if st.button("執行 AI 市場分析"):
 # requests
 # beautifulsoup4
 # pandas
-# numpy
-# google-genai
+# google-generativeai
 # streamlit-autorefresh
