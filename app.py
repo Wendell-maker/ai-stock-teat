@@ -1,271 +1,259 @@
 import streamlit as st
 import pandas as pd
-import yfinance as yf
 import requests
-from bs4 import BeautifulSoup
-import google.generativeai as genai
-import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import google.generativeai as genai
 import io
 
-# --- 基礎設定 ---
+# --- 全局設定 ---
+st.set_page_config(
+    page_title="Taifex 戰情室 - 混合模式版",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-def init_page_config():
-    """
-    初始化 Streamlit 頁面設定，包含標題、佈局與自定義 CSS 樣式。
-    """
-    st.set_page_config(layout="wide", page_title="台股 AI 戰情室 | 籌碼與策略整合版")
-    
-    # 注入深色模式與自定義 CSS
-    st.markdown("""
-        <style>
-        body { background-color: #0E1117; color: #FAFAFA; }
-        .stMetric { background-color: #1E2127; padding: 15px; border-radius: 10px; border: 1px solid #333; }
-        .stAlert { background-color: #1E2127; color: #FAFAFA; border: 1px solid #444; }
-        [data-testid="stSidebar"] { background-color: #0E1117; }
-        </style>
-    """, unsafe_allow_html=True)
-
-# --- 數據抓取模組 (Web Scraper) ---
+# --- 數據抓取模組 ---
 
 def get_fii_oi() -> int | None:
     """
-    抓取期交所外資期貨淨未平倉口數 (FII Net Open Interest)。
+    透過 POST 請求從期交所抓取「外資」在「臺股期貨」的未平倉淨額。
     
-    回傳:
-        int: 外資淨未平倉口數 (正數為多，負數為空)
+    Returns:
+        int: 外資期貨淨未平倉口數。
+        None: 若抓取失敗或資料尚未更新則回傳 None。
     """
     url = "https://www.taifex.com.tw/cht/3/futContractsDate"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return None
-        
-        # 使用 pandas 解析表格 (台指期貨通常在第一個表格)
-        dfs = pd.read_html(io.StringIO(response.text))
-        df = dfs[2]  # 期交所結構中，大台通常在第三個表格
+    
+    # 預設抓取當日，若當日無資料(如假日或未收盤)，邏輯應由 UI 控制或回傳 None
+    target_date = datetime.now().strftime('%Y/%m/%d')
+    
+    payload = {
+        'queryType': '1',
+        'goDay': '',
+        'doQuery': '1',
+        'dateaddcnt': '',
+        'queryDate': target_date,
+        'commodityId': ''
+    }
 
-        # 邏輯：尋找 "外資" 且 "多空相抵" 的 "未平倉量"
-        # 注意：期交所表格結構可能變動，此處使用關鍵字索引
-        target_row = df[df.iloc[:, 2].str.contains("外資", na=False)]
-        net_oi = int(target_row.iloc[0, 14]) # 第15欄通常是未平倉淨額
+    try:
+        response = requests.post(url, data=payload, headers=headers, timeout=10)
+        response.encoding = 'utf-8'
+        
+        # 使用 pandas 解析 HTML 表格
+        tables = pd.read_html(io.StringIO(response.text))
+        
+        # 期交所該頁面通常第 3 個表格是目標數據 (視期交所改版情況而定)
+        # 我們搜尋包含 "臺股期貨" 與 "外資" 的 DataFrame
+        df = None
+        for t in tables:
+            if '臺股期貨' in t.to_string():
+                df = t
+                break
+        
+        if df is None:
+            return None
+
+        # 處理多層次表頭或特定格式
+        # 邏輯：找到「臺股期貨」那一行，且其身分為「外資」
+        # 欄位通常為：0:商品, 1:身份, 9:未平倉淨額
+        # 注意：不同日期的表格結構可能略有差異，這裡採用較穩健的過濾法
+        
+        # 篩選外資行 (通常在臺股期貨區塊下的第三列)
+        fii_row = df[(df.iloc[:, 1].str.contains('外資', na=False)) & 
+                    (df.iloc[:, 0].str.contains('臺股期貨', na=False) | df.iloc[:, 0].isna())].iloc[0]
+        
+        # 取得「未平倉淨額」通常在倒數第 3 欄
+        net_oi = int(str(fii_row.iloc[-3]).replace(',', ''))
         return net_oi
+
     except Exception as e:
-        st.error(f"抓取外資籌碼失敗: {e}")
+        st.error(f"外資數據抓取錯誤: {e}")
         return None
 
 def get_option_max_oi() -> int | None:
     """
-    抓取期交所選擇權近月 Call 最大未平倉履約價 (Call Wall)。
+    透過 POST 請求從期交所抓取選擇權 (TXO) 的 Call Wall (最大 OI 履約價)。
     
-    回傳:
-        int: 最大未平倉之履約價 (壓力位)
+    Returns:
+        int: 買權最大未平倉量之履約價。
+        None: 若抓取失敗則回傳 None。
     """
     url = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
+    
+    payload = {
+        'queryType': '2',
+        'marketCode': '0',  # 一般盤
+        'dateaddcnt': '',
+        'queryDate': datetime.now().strftime('%Y/%m/%d'),
+        'commodityId': 'TXO'
+    }
+
     try:
-        # 獲取今日日期參數
-        payload = {
-            "queryType": "2",
-            "marketCode": "0",
-            "dateCnt": "1",
-            "commodity_id": "TXO"
-        }
         response = requests.post(url, data=payload, headers=headers, timeout=10)
-        dfs = pd.read_html(io.StringIO(response.text))
+        response.encoding = 'utf-8'
+        
+        tables = pd.read_html(io.StringIO(response.text))
         
         # 尋找選擇權行情表
-        df = dfs[2]
-        df.columns = df.columns.get_level_values(-1) # 處理多層表頭
+        df = None
+        for t in tables:
+            if '履約價' in t.to_string() and '買權' in t.to_string():
+                df = t
+                break
         
-        # 過濾 Call (買權) 與 未平倉量
-        # 欄位說明：履約價, 買賣權, 未平倉量
-        call_df = df[df['買賣權'] == 'Call'].copy()
-        call_df['未平倉量'] = pd.to_numeric(call_df['未平倉量'], errors='coerce')
-        call_df['履約價'] = pd.to_numeric(call_df['履約價'], errors='coerce')
+        if df is None:
+            return None
+
+        # 清洗數據
+        # 典型的期交所選擇權表格：履約價在某欄，買權 OI 在某欄
+        # 我們將 DataFrame 重新命名或定位
+        # 履約價通常在第 2 欄 (index 1)，買權 OI 在第 6 欄 (index 5)
+        df_clean = df.iloc[:, [1, 5]].copy()
+        df_clean.columns = ['Strike', 'Call_OI']
         
-        # 找出最大 OI 所在的履約價
-        max_oi_idx = call_df['未平倉量'].idxmax()
-        call_wall = int(call_df.loc[max_oi_idx, '履約價'])
-        return call_wall
+        # 轉換數值並移除逗號與非數字
+        df_clean['Call_OI'] = pd.to_numeric(df_clean['Call_OI'].astype(str).str.replace(',', ''), errors='coerce')
+        df_clean['Strike'] = pd.to_numeric(df_clean['Strike'], errors='coerce')
+        
+        # 移除空值並找到最大 OI 的履約價
+        max_oi_row = df_clean.dropna().loc[df_clean['Call_OI'].idxmax()]
+        return int(max_oi_row['Strike'])
+
     except Exception as e:
-        st.error(f"抓取選擇權壓力失敗: {e}")
+        st.error(f"選擇權數據抓取錯誤: {e}")
         return None
 
-# --- 市場數據模組 (yfinance) ---
+# --- AI 分析模組 ---
 
-@st.cache_data(ttl=600)
-def get_market_data():
+def analyze_market_with_gemini(api_key: str, fii_oi: int, call_wall: int):
     """
-    獲取市場關鍵指標數據。
-    """
-    tickers = {
-        "加權指數": "^TWII",
-        "台積電": "2330.TW",
-        "VIX (恐慌指數)": "^VIX" # 註：此為美股 VIX，台股 VIX 需另爬
-    }
-    data = {}
-    for name, sym in tickers.items():
-        ticker = yf.Ticker(sym)
-        hist = ticker.history(period="2d")
-        if not hist.empty:
-            current = hist['Close'].iloc[-1]
-            prev = hist['Close'].iloc[-2]
-            change = current - prev
-            data[name] = {"price": current, "change": change}
-    return data
-
-# --- AI 分析核心 ---
-
-def run_ai_analysis(api_key, market_info, fii_oi, call_wall):
-    """
-    調用 Gemini 3 Flash 模型進行盤勢綜合分析。
+    呼叫 Gemini API 進行市場籌碼面診斷。
+    
+    Args:
+        api_key (str): Google API Key.
+        fii_oi (int): 外資淨未平倉量.
+        call_wall (int): 選擇權壓力履約價.
     """
     if not api_key:
-        return "請提供 Gemini API Key 以啟動 AI 分析。"
-
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash-latest') # 穩定版語法
-
-    # 構建加強版 Prompt
-    prompt = f"""
-    你是一位資深的台股量化交易專家。請根據以下數據進行深度的戰情評估：
-
-    [當前數據]
-    - 市場價格: {market_info}
-    - 外資期貨淨未平倉 (FII Net OI): {fii_oi} 口
-    - 選擇權最大 OI 壓力位 (Call Wall): {call_wall}
-
-    [Trader Logic Upgrade]
-    1. **Institutional Filter**: 當前外資淨口數為 {fii_oi}。若外資持有大量空單 (例如 < -15,000)，即使價格上漲也需警示「法人壓盤風險」。
-    2. **Option Wall Filter**: 當前壓力位在 {call_wall}。若指數接近此水位，需警示「莊家防守/上方空間受限」(Gamma Exposure)。
-    3. **Volume Divergence**: 觀察價格與成交量的背離情況。
-
-    請提供 300 字以內的專業分析報告，包含「多空評價」、「風險警示」與「操作建議」。
-    使用繁體中文，語氣需精簡且具有洞察力。
-    """
+        st.info("💡 請在側邊欄輸入 Gemini API Key 以啟動 AI 診斷。")
+        return
 
     try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash') # 預設使用 flash 版本進行快速分析
+        
+        prompt = f"""
+        [Trader Logic Upgrade]
+        你是一位專業的台股量化交易員，請根據以下今日籌碼數據進行市場診斷：
+        
+        1. **Institutional Filter**: 
+           當前外資期貨淨未平倉 (FII Net OI) 為: {fii_oi} 口。
+           - 若 FII < -15000，請發出「法人強烈偏空/避險」警告。
+           - 若 FII > 0，說明法人籌碼偏多。
+        
+        2. **Option Wall Filter**: 
+           當前買權最大未平倉壓力位 (Call Wall) 為: {call_wall} 點。
+           - 若目前指數接近此價位，請警告「上方壓力沉重，漲勢受限」。
+        
+        請用繁體中文提供：
+        - 市場情緒評級 (偏多/中性/偏空)
+        - 風險提示
+        - 具體操作建議
+        """
+        
         response = model.generate_content(prompt)
-        return response.text
+        st.markdown("### 🤖 Gemini AI 市場診斷")
+        st.write(response.text)
+        
     except Exception as e:
-        return f"AI 分析發生錯誤: {str(e)}"
+        st.error(f"AI 分析失敗: {e}")
 
-# --- UI 佈局主程式 ---
+# --- Streamlit UI 主程式 ---
 
 def main():
-    init_page_config()
-    
-    st.title("🚀 台股 AI 戰情室")
-    st.markdown(f"更新時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.title("🏹 Taifex 戰情室 (Scraper Fix Edition)")
+    st.markdown(f"**數據更新日期**: {datetime.now().strftime('%Y-%m-%d')}")
 
-    # Sidebar - 設定
+    # --- 側邊欄：籌碼數據獲取區 (混合模式) ---
     with st.sidebar:
-        st.header("⚙️ 系統設定")
-        api_key = st.text_input("Gemini API Key", type="password")
-        st.divider()
-        st.info("本系統整合期交所即時籌碼與 Google Gemini 3 Flash 進行盤勢判讀。")
-
-    # 數據獲取
-    with st.spinner('正在同步市場數據與籌碼資訊...'):
-        market_data = get_market_data()
-        fii_oi = get_fii_oi()
-        call_wall = get_option_max_oi()
-
-    # --- Row 1: 市場指標 ---
-    col1, col2, col3, col4 = st.columns(4)
-    
-    if "加權指數" in market_data:
-        idx = market_data["加權指數"]
-        col1.metric("加權指數", f"{idx['price']:,.2f}", f"{idx['change']:+.2f}")
-    
-    if "台積電" in market_data:
-        tsmc = market_data["台積電"]
-        col2.metric("台積電 (2330)", f"{tsmc['price']:,.1f}", f"{tsmc['change']:+.1f}")
-
-    # --- Row 2: 籌碼監控 (關鍵區塊) ---
-    st.subheader("📊 關鍵籌碼監控")
-    chip_col1, chip_col2, chip_col3 = st.columns(3)
-
-    # 外資淨口數 (FII OI)
-    if fii_oi is not None:
-        color = "normal" if fii_oi >= 0 else "inverse"
-        status = "偏多" if fii_oi > 0 else "偏空"
-        if fii_oi < -15000: status = "極度偏空 (警報)"
+        st.header("🔧 參數設定")
+        gemini_key = st.text_input("Gemini API Key", type="password")
         
-        chip_col1.metric(
-            label="外資期貨淨未平倉 (Net OI)",
-            value=f"{fii_oi:,} 口",
-            delta=status,
+        st.divider()
+        st.subheader("📊 籌碼數據 (混合模式)")
+        
+        # 1. 外資期貨淨單
+        with st.spinner("正在自動獲取外資數據..."):
+            auto_fii_oi = get_fii_oi()
+        
+        if auto_fii_oi is None:
+            st.warning("⚠️ 無法自動抓取外資數據 (可能尚未更新或防爬蟲)，請手動輸入")
+            fii_oi = st.number_input("外資期貨淨未平倉 (口)", value=-15000, step=100)
+        else:
+            st.success(f"✅ 自動抓取成功")
+            fii_oi = st.number_input("外資期貨淨未平倉 (口)", value=auto_fii_oi, step=100)
+
+        # 2. 選擇權 Call Wall
+        with st.spinner("正在自動獲取選擇權數據..."):
+            auto_call_wall = get_option_max_oi()
+            
+        if auto_call_wall is None:
+            st.warning("⚠️ 無法自動抓取選擇權數據")
+            call_wall = st.number_input("Call Wall 壓力履約價", value=23000, step=100)
+        else:
+            st.success(f"✅ 自動抓取成功")
+            call_wall = st.number_input("Call Wall 壓力履約價", value=auto_call_wall, step=100)
+
+    # --- 主畫面：儀表板展現 ---
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        color = "normal" if fii_oi > -15000 else "inverse"
+        st.metric(
+            label="外資期貨淨未平倉 (口)", 
+            value=f"{fii_oi:,}", 
+            delta=f"{fii_oi + 15000 if fii_oi < -15000 else 0} (距警戒線)",
             delta_color=color
         )
-    else:
-        chip_col1.error("無法讀取外資數據")
-
-    # 選擇權壓力 (Call Wall)
-    if call_wall:
-        chip_col2.metric(
-            label="Market Resistance (Call Wall)",
-            value=f"{call_wall:,}",
-            delta="壓力位",
-            delta_color="off"
+        
+    with col2:
+        st.metric(
+            label="Call Wall 強力壓力位", 
+            value=f"{call_wall} 點"
         )
-    else:
-        chip_col2.error("無法讀取選擇權數據")
 
-    # VIX 指標
-    if "VIX (恐慌指數)" in market_data:
-        vix = market_data["VIX (恐慌指數)"]
-        chip_col3.metric("市場波動率 (VIX)", f"{vix['price']:.2f}", f"{vix['change']:+.2f}", delta_color="inverse")
+    st.divider()
 
     # --- AI 分析區塊 ---
-    st.divider()
-    st.subheader("🤖 Gemini 3 Flash AI 戰略評論")
-    
-    if st.button("執行 AI 深度判讀"):
-        if api_key:
-            analysis_result = run_ai_analysis(
-                api_key, 
-                str(market_data), 
-                fii_oi if fii_oi else "未知", 
-                call_wall if call_wall else "未知"
-            )
-            st.markdown(f"""
-            <div style="background-color: #1E2127; padding: 20px; border-left: 5px solid #00D1B2; border-radius: 5px;">
-                {analysis_result}
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.warning("請在側邊欄輸入 API Key 以進行 AI 分析。")
+    if st.button("🚀 執行 AI 深度診斷"):
+        analyze_market_with_gemini(gemini_key, fii_oi, call_wall)
+    else:
+        st.info("點擊上方按鈕進行 AI 籌碼面解讀。")
 
-    # --- 圖表區 (Bottom) ---
-    st.divider()
-    st.subheader("📈 指數走勢回顧")
-    twii = yf.Ticker("^TWII").history(period="1mo")
-    fig = go.Figure(data=[go.Candlestick(x=twii.index,
-                open=twii['Open'],
-                high=twii['High'],
-                low=twii['Low'],
-                close=twii['Close'],
-                name="加權指數")])
-    fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=400)
-    st.plotly_chart(fig, use_container_width=True)
+    # --- 補充資訊 ---
+    with st.expander("📌 使用說明"):
+        st.write("""
+        1. **自動抓取**: 程式啟動時會自動嘗試從期交所 POST 數據。
+        2. **手動修正**: 若期交所因假日或網站架構更動導致抓取失敗，您可以直接在側邊欄手動輸入數據。
+        3. **AI 診斷**: 整合 Google Gemini，針對外資部位與選擇權壓力進行量化邏輯分析。
+        4. **數據延遲**: 盤後數據通常於 15:00 - 15:30 之間更新。
+        """)
 
 if __name__ == "__main__":
     main()
 
 # --- requirements.txt ---
 # streamlit
-# yfinance
 # pandas
 # requests
-# beautifulsoup4
-# google-generativeai
 # lxml
 # html5lib
-# plotly
+# google-generativeai
