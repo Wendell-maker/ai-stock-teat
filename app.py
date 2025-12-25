@@ -708,7 +708,7 @@ if auto_refresh:
 # plotly
 [patch]--- a/app.py
 +++ b/app.py
-     fugle_key = st.text_input("Fugle API Key", type="password", placeholder="Optional (For TXF)")
+fugle_key = st.text_input("Fugle API Key", type="password", placeholder="Optional (For TXF)")
      
      # 更新 session state
 +    st.session_state['gemini_ok'] = False
