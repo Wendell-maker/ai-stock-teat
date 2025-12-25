@@ -706,20 +706,17 @@ if auto_refresh:
 # google-generativeai
 # fugle-marketdata
 # plotly
-[patch]--- a/app.py
-+++ b/app.py
 fugle_key = st.text_input("Fugle API Key", type="password", placeholder="Optional (For TXF)")
      
      # 更新 session state
-+    st.session_state['gemini_ok'] = False
+     st.session_state['gemini_ok'] = False
      if gemini_key:
          try:
              genai.configure(api_key=gemini_key)
              st.session_state['gemini_ok'] = True
--        except: st.session_state['gemini_ok'] = False
--    
-+        except Exception:
-+            pass
+
+         except Exception:
+             pass
      if fugle_key:
          st.session_state['fugle_ok'] = True
      else:
