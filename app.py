@@ -1,30 +1,30 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import yfinance as yf
-import plotly.graph_objects as go
-import google.generativeai as genai
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+import google.generativeai as genai
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
 import time
 
-# --- 全域配置與樣式 ---
+# --- 頁面配置 (React-Like Style) ---
 st.set_page_config(
-    page_title="專業操盤戰情室 | AI Trading Terminal",
+    page_title="Professional Trading Ops Center",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 注入自定義 CSS 仿照 React/Modern App 介面
+# 自定義 CSS 以優化 UI 質感 (模仿現代 React Dashboard)
 st.markdown("""
 <style>
-    .main { background-color: #0e1117; }
-    .stMetric { background-color: #1e2130; padding: 15px; border-radius: 10px; border-left: 5px solid #00d4ff; }
-    .sidebar-section { padding: 10px; background-color: #262730; border-radius: 8px; margin-bottom: 10px; }
-    .status-online { color: #00ff00; font-weight: bold; }
-    .status-offline { color: #ff4b4b; font-weight: bold; }
-    section[data-testid="stSidebar"] { width: 350px !important; }
+    .main { background-color: #0e1117; color: #ffffff; }
+    .stMetric { background-color: #1e2130; padding: 15px; border-radius: 10px; border: 1px solid #30363d; }
+    .sidebar .sidebar-content { background-image: linear-gradient(#1e2130, #0e1117); }
+    .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #238636; color: white; border: none; }
+    .stTextInput>div>div>input { background-color: #0d1117; color: white; border: 1px solid #30363d; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -32,203 +32,176 @@ st.markdown("""
 
 def get_realtime_futures():
     """
-    透過爬蟲獲取 Yahoo 股市台指期近一 (TXFR1) 的即時報價。
+    爬取 Yahoo 股市台指期近月 (TXFR1) 即時報價。
     
     Returns:
-        dict: 包含價格、漲跌幅、成交量等數據。
+        float: 當前點數。若失敗則回傳 0.0。
     """
-    url = "https://tw.stock.yahoo.com/quote/TXFR1.TW"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        url = "https://tw.stock.yahoo.com/quote/TXFR1.TW"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        response = requests.get(url, headers=headers, timeout=5)
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 爬取價格 (根據 Yahoo 股市當前 DOM 結構)
-        price = soup.find('span', class_=['Fz(32px)', 'Fw(b)', 'Lh(1)', 'C($c-trend-down)', 'C($c-trend-up)']).text
-        change = soup.find('span', class_=['Fz(20px)', 'Fw(b)', 'Lh(1)', 'Mend(4px)']).text
-        percent = soup.find_all('span', class_=['Fz(20px)', 'Fw(b)', 'Lh(1)'])[1].text
-        
-        return {
-            "symbol": "台指期近一",
-            "price": float(price.replace(',', '')),
-            "change": change,
-            "percent": percent,
-            "status": "Success"
-        }
+        # 尋找報價標籤 (Yahoo 股市常見 Class Name)
+        price_tag = soup.find('span', {'class': ['Fz(32px) Fw(b) Lh(1) C($c-trend-up)', 'Fz(32px) Fw(b) Lh(1) C($c-trend-down)', 'Fz(32px) Fw(b) Lh(1)']})
+        if price_tag:
+            price_str = price_tag.text.replace(',', '')
+            return float(price_str)
+        return 0.0
     except Exception as e:
-        return {"status": "Error", "message": str(e)}
+        print(f"Crawler Error: {e}")
+        return 0.0
 
-def get_market_data(ticker="^TWII", period="1mo", interval="1d"):
+def get_market_data(ticker_symbol="^TWII", period="1mo", interval="1d"):
     """
-    獲取市場歷史數據並強制轉型為標量 (Scalar)。
+    獲取市場歷史數據並進行數值轉型防呆。
     
     Args:
-        ticker (str): 股票代碼.
+        ticker_symbol (str): 標的代碼.
         period (str): 時間範圍.
-        interval (str): 時間間隔.
+        interval (str): K線週期.
         
     Returns:
-        tuple: (DataFrame, float: 當前價格, float: 漲跌)
+        tuple: (DataFrame, float, float) -> (數據表, 最新收盤價, 波動率)
     """
-    data = yf.download(ticker, period=period, interval=interval, progress=False)
-    if data.empty:
-        return None, 0.0, 0.0
-    
-    # 強制轉型防呆 (Scalar Conversion)
-    # 使用 iloc[-1] 並明確轉為 float 避免 Series 報錯
-    current_price = float(data['Close'].iloc[-1])
-    prev_price = float(data['Close'].iloc[-2])
-    change = current_price - prev_price
-    
-    return data, current_price, change
+    try:
+        data = yf.download(ticker_symbol, period=period, interval=interval, progress=False)
+        if data.empty:
+            return pd.DataFrame(), 0.0, None
+        
+        # 強制標量轉換 (Scalar Conversion)
+        last_close = float(data['Close'].iloc[-1])
+        
+        # 計算波動率 (標準差)
+        returns = data['Close'].pct_change().dropna()
+        volatility = float(returns.std()) if not returns.empty else None
+        
+        return data, last_close, volatility
+    except Exception as e:
+        st.error(f"數據抓取失敗: {e}")
+        return pd.DataFrame(), 0.0, None
 
 # --- AI 分析模組 ---
 
-def get_ai_analysis(api_key, market_info, data_summary):
+def generate_ai_insight(api_key, context_data):
     """
-    呼叫 Gemini API 進行盤勢分析。
+    調用 Gemini API 進行盤勢分析。
     """
     if not api_key:
-        return "請先於側邊欄輸入 API Key 以啟用 AI 分析功能。"
+        return "請在側邊欄輸入 API 金鑰以啟用 AI 分析。"
     
     try:
         genai.configure(api_key=api_key)
-        # 使用用戶要求的指定模型
-        model = genai.GenerativeModel('gemini-1.5-flash') # 注意：目前公開穩定版為 1.5-flash
+        model = genai.GenerativeModel('gemini-3-flash-preview')
         
         prompt = f"""
-        你是一位資深量化交易員。請根據以下數據進行簡短、精闢的市場分析：
-        
-        市場數據摘要：
-        {data_summary}
-        
-        即時報價資訊：
-        {market_info}
-        
-        請提供：
-        1. 當前趨勢解讀 (多/空/盤整)
-        2. 關鍵支撐與壓力位預測
-        3. 交易策略建議 (短線操作)
+        你是一位資深量化交易員。請根據以下數據進行簡短分析：
+        數據摘要：{context_data}
+        1. 判斷目前趨勢 (多/空/盤整)。
+        2. 提供一個技術面支撐點與壓力點。
+        3. 風險提示。
+        請用繁體中文回答，語氣專業簡潔。
         """
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"AI 分析出錯: {str(e)}"
+        return f"AI 分析生成失敗: {str(e)}"
 
-# --- UI 側邊欄設計 (React Style) ---
-
-def render_sidebar():
-    with st.sidebar:
-        st.title("⚙️ 系統控制台")
-        
-        # 1. 功能狀態檢測區塊
-        with st.container():
-            st.subheader("📡 功能狀態檢測")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write("數據流:")
-                st.write("AI 引擎:")
-            with col2:
-                st.markdown('<span class="status-online">● ONLINE</span>', unsafe_allow_html=True)
-                st.markdown('<span class="status-online">● READY</span>', unsafe_allow_html=True)
-        
-        st.divider()
-        
-        # 2. API 金鑰管理
-        with st.expander("🔑 API 金鑰管理", expanded=True):
-            gemini_key = st.text_input("Gemini API Key", type="password", placeholder="Paste key here...")
-            st.caption("金鑰僅供當前 Session 使用，不會儲存於伺服器。")
-            
-        # 3. 自動監控設定
-        with st.expander("🤖 自動監控設定"):
-            st.toggle("啟用自動刷新", value=False)
-            refresh_rate = st.slider("刷新頻率 (秒)", 10, 300, 60)
-            st.selectbox("監控標的", ["台指期 (TXFR1)", "加權指數 (^TWII)", "台積電 (2330.TW)"])
-
-        # 4. Telegram 通知
-        with st.expander("✈️ Telegram 通知"):
-            st.text_input("Bot Token", type="password")
-            st.text_input("Chat ID")
-            st.button("發送測試通知", use_container_width=True)
-            
-        st.divider()
-        st.info(f"最後更新: {datetime.now().strftime('%H:%M:%S')}")
-        
-    return gemini_key
-
-# --- 主畫面佈局 ---
+# --- 主程式邏輯 ---
 
 def main():
-    api_key = render_sidebar()
-    
-    st.title("📈 專業操盤戰情室")
-    
-    # 第一列：核心指標卡片
-    col_f, col_i, col_v = st.columns(3)
-    
-    # 獲取期貨即時數據 (爬蟲)
-    futures_data = get_realtime_futures()
-    if futures_data["status"] == "Success":
-        with col_f:
-            st.metric("台指期近一 (即時)", 
-                      f"{futures_data['price']:,}", 
-                      f"{futures_data['change']} ({futures_data['percent']})")
-    else:
-        col_f.error("期貨數據爬取失敗")
+    # 初始化計時器 (用於系統延遲顯示)
+    start_process_time = time.time()
 
-    # 獲取指數數據 (yfinance)
-    df, curr_idx, diff = get_market_data("^TWII")
-    with col_i:
-        st.metric("台灣加權指數", f"{curr_idx:,.2f}", f"{diff:+,.2f}")
-    
-    with col_v:
-        st.metric("市場情緒指標 (VIX)", "18.42", "-1.2%", delta_color="inverse")
+    # --- Sidebar 設計 ---
+    with st.sidebar:
+        st.title("⚙️ 系統設定")
+        st.markdown("---")
+        api_key = st.text_input("Gemini API Key", type="password", help="請輸入您的 Google AI API Key")
+        
+        target_ticker = st.text_input("監控標的 (Yahoo Finance Symbol)", value="^TWII")
+        analysis_mode = st.selectbox("分析頻率", ["即時更新", "每日回顧", "趨勢掃描"])
+        
+        st.markdown("---")
+        st.info("💡 系統提示：本介面每 60 秒自動刷新數據。")
+        
+        if st.button("手動刷新數據"):
+            st.rerun()
 
-    # 第二列：圖表與 AI 分析
-    col_chart, col_ai = st.columns([2, 1])
+    # --- 頂部數據列 (Metrics) ---
+    st.title("🚀 專業操盤戰情室")
     
-    with col_chart:
-        st.subheader("📊 技術分析 K 線圖")
-        if df is not None:
-            fig = go.Figure(data=[go.Candlestick(
-                x=df.index,
-                open=df['Open'],
-                high=df['High'],
-                low=df['Low'],
-                close=df['Close'],
-                name="K-Line"
-            )])
+    # 計算系統延遲 (Fix: NameError - np_delay 必須在此先計算)
+    np_delay = (time.time() - start_process_time) * 1000 
+    
+    # 獲取即時數據
+    txf_price = get_realtime_futures()
+    hist_data, mkt_price, volatility = get_market_data(target_ticker)
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("台指期即時 (TXFR1)", f"{txf_price:,.0f}", delta=None)
+    
+    with col2:
+        st.metric(f"{target_ticker} 收盤", f"{mkt_price:,.2f}")
+        
+    with col3:
+        # Fix: TypeError - 檢查 volatility 類型再格式化
+        if isinstance(volatility, (int, float)):
+            vol_display = f"{volatility:.2%}"
+        else:
+            vol_display = "N/A"
+        st.metric("市場波動率 (Std)", vol_display)
+        
+    with col4:
+        st.metric("系統延遲 (Latency)", f"{np_delay:.2f} ms")
+
+    # --- 圖表與分析區 ---
+    tab1, tab2 = st.tabs(["📊 技術圖表", "🤖 AI 深度分析"])
+    
+    with tab1:
+        if not hist_data.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Candlestick(
+                x=hist_data.index,
+                open=hist_data['Open'],
+                high=hist_data['High'],
+                low=hist_data['Low'],
+                close=hist_data['Close'],
+                name="K線"
+            ))
             fig.update_layout(
                 template="plotly_dark",
                 xaxis_rangeslider_visible=False,
-                margin=dict(l=10, r=10, t=10, b=10),
-                height=500
+                height=500,
+                margin=dict(l=10, r=10, t=10, b=10)
             )
             st.plotly_chart(fig, use_container_width=True)
-            
-    with col_ai:
-        st.subheader("🧠 AI 策略分析")
-        with st.container():
-            if st.button("🚀 執行 AI 診斷"):
-                with st.spinner("AI 正在分析市場趨勢..."):
-                    summary = f"Price: {curr_idx}, Change: {diff}"
-                    market_info = f"Futures: {futures_data}"
-                    analysis = get_ai_analysis(api_key, market_info, summary)
-                    st.markdown(f"**分析結果：**\n\n{analysis}")
-            else:
-                st.write("點擊上方按鈕開始 AI 盤勢分析")
+        else:
+            st.warning("無圖表數據可顯示。")
 
-    # 第三列：自選股監控與細節
-    st.subheader("📑 即時觀察名單")
-    watch_list = ["2330.TW", "2317.TW", "2454.TW"]
-    watch_df = []
-    for t in watch_list:
-        _, p, c = get_market_data(t, period="2d")
-        watch_df.append({"代碼": t, "當前價格": p, "漲跌幅": f"{c:+,.2f}"})
-    
-    st.table(pd.DataFrame(watch_df))
+    with tab2:
+        st.subheader("Gemini 智能決策建議")
+        context = {
+            "symbol": target_ticker,
+            "current_price": mkt_price,
+            "txf_futures": txf_price,
+            "volatility": vol_display,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        if st.button("生成 AI 分析報表"):
+            with st.spinner("AI 正在思考中..."):
+                analysis_result = generate_ai_insight(api_key, str(context))
+                st.markdown(f"```\n{analysis_result}\n```")
+        else:
+            st.info("點擊上方按鈕開始 AI 盤勢診斷。")
+
+    # --- 頁尾 ---
+    st.markdown("---")
+    st.caption(f"最後更新時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Data source: Yahoo Finance")
 
 if __name__ == "__main__":
     main()
@@ -236,8 +209,9 @@ if __name__ == "__main__":
 # --- requirements.txt ---
 # streamlit
 # pandas
+# numpy
 # yfinance
-# plotly
-# google-generativeai
 # requests
 # beautifulsoup4
+# google-generativeai
+# plotly
