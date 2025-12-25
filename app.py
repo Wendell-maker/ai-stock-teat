@@ -709,8 +709,8 @@ if auto_refresh:
 fugle_key = st.text_input("Fugle API Key", type="password", placeholder="Optional (For TXF)")
      
      # 更新 session state
-    st.session_state['gemini_ok'] = False
-     if gemini_key:
+st.session_state['gemini_ok'] = False
+if gemini_key:
          try:
              genai.configure(api_key=gemini_key)
              st.session_state['gemini_ok'] = True
