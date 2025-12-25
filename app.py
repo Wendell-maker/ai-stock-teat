@@ -717,7 +717,7 @@ if gemini_key:
 
          except Exception:
              pass
-    if fugle_key:
+if fugle_key:
         st.session_state['fugle_ok'] = True
     else:
         st.session_state['fugle_ok'] = False
