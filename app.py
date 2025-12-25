@@ -353,7 +353,6 @@ if auto_refresh:
 # fugle-marketdata
 # plotly
 [instruction]
-[filepath]app.py
 [code]import streamlit as st
 import pandas as pd
 import yfinance as yf
