@@ -719,5 +719,5 @@ if gemini_key:
              pass
 if fugle_key:
         st.session_state['fugle_ok'] = True
-    else:
+else:
         st.session_state['fugle_ok'] = False
