@@ -353,7 +353,6 @@ if auto_refresh:
 # fugle-marketdata
 # plotly
 [instruction]
-[code]import streamlit as st
 import pandas as pd
 import yfinance as yf
 import google.generativeai as genai
