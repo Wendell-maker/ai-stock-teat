@@ -105,9 +105,9 @@ def get_market_data(ticker_symbol):
 
 def get_futures_data():
     """
-    抓取台指期數據 (代號 WTX=F)。
+    抓取台指期數據 (代號 WTX&)。
     """
-    return get_market_data("WTX=F")
+    return get_market_data("WTX&")
 
 def calculate_technical_indicators(df):
     """
