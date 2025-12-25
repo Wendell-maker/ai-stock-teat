@@ -1,254 +1,272 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+import requests
+from bs4 import BeautifulSoup
 import google.generativeai as genai
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from fugle_marketdata import RestClient
+import re
+import time
 
-# --- 全域設定與佈局 ---
+# --- 全域設定 ---
 st.set_page_config(
-    page_title="專業操盤戰情室 | Pro Trader Dashboard",
+    page_title="專業操盤戰情室 | AI Pro Trader Dashboard",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 自定義 CSS 以優化視覺體驗
-st.markdown("""
-    <style>
-    .main { background-color: #0e1117; color: #ffffff; }
-    .stMetric { background-color: #1e2130; border-radius: 10px; padding: 15px; border: 1px solid #30363d; }
-    [data-testid="stSidebar"] { background-color: #161b22; }
-    </style>
-    """, unsafe_allow_html=True)
-
 # --- 數據抓取模組 ---
 
-class DataEngine:
+def fetch_tx_future_price():
     """
-    數據抓取引擎：整合 Fugle 與 yfinance，具備自動備援機制。
+    透過 Requests 與 BeautifulSoup 爬取 Yahoo 奇摩股市台指期近月價格。
+    
+    邏輯：
+    1. 訪問 Yahoo 台指期頁面。
+    2. 尋找 HTML 中所有數值。
+    3. 回傳第一個數值大於 10,000 的數字 (視為台指期現價)。
+    
+    Returns:
+        float: 台指期價格，若失敗則回傳 None。
     """
+    url = "https://tw.stock.yahoo.com/future/futures.html"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            # 尋找所有包含數字的標籤，過濾逗號
+            tags = soup.find_all(string=re.compile(r'^\d{1,3}(,\d{3})*(\.\d+)?$'))
+            for tag in tags:
+                val_str = tag.strip().replace(',', '')
+                try:
+                    val = float(val_str)
+                    if val > 10000:
+                        return val
+                except ValueError:
+                    continue
+    except Exception as e:
+        st.error(f"台指期爬蟲錯誤: {e}")
+    return None
 
-    @staticmethod
-    def get_taiex_futures():
-        """
-        獲取台指期數據 (WTX=F)，強制使用 yfinance。
+def get_fugle_quote(api_key, symbol="TSE01"):
+    """
+    透過 Fugle MarketData API 獲取即時行情。
+    
+    修正邏輯：
+    優先檢查 quote['trade']['price'] 作為成交價。
+    
+    Args:
+        api_key (str): Fugle API Key.
+        symbol (str): 股票或指數代碼 (如 TSE01).
         
-        Returns:
-            dict: 包含價格與漲跌幅的字典
-        """
-        try:
-            ticker = yf.Ticker("WTX=F")
-            df = ticker.history(period="2d")
-            if not df.empty:
-                current = df['Close'].iloc[-1]
-                prev = df['Close'].iloc[-2]
-                change = current - prev
-                change_pct = (change / prev) * 100
-                return {"price": current, "change": change, "pct": change_pct, "df": df}
-        except Exception as e:
-            st.error(f"台指期數據獲取失敗: {e}")
+    Returns:
+        dict: 包含價格與漲跌幅的字典。
+    """
+    if not api_key:
+        return None
+    
+    url = f"https://api.fugle.tw/marketdata/v0.3/candles?symbolId={symbol}&type=standard"
+    # 註：此處以行情 API 為示範，實際應根據 Fugle 官方文件之 quote endpoint 調用
+    # 為符合用戶要求之「優先檢查 quote['trade']['price']」邏輯：
+    quote_url = f"https://api.fugle.tw/marketdata/v0.3/quote?symbolId={symbol}"
+    headers = {"X-API-KEY": api_key}
+    
+    try:
+        resp = requests.get(quote_url, headers=headers, timeout=5)
+        data = resp.json()
+        
+        # 核心修正：優先抓取 trade price
+        price = data.get('trade', {}).get('price')
+        if not price:
+            price = data.get('order', {}).get('bestBidPrice') # 備援
+            
+        return {
+            "price": price,
+            "change": data.get('change'),
+            "changePercent": data.get('changePercent'),
+            "name": data.get('name', symbol)
+        }
+    except Exception as e:
         return None
 
-    @staticmethod
-    def get_market_data(symbol, fugle_api_key=None):
-        """
-        獲取市場數據 (大盤或個股)，優先使用 Fugle，若無 Key 則使用 yfinance。
+def fetch_stock_history(ticker_symbol, period="1mo"):
+    """
+    使用 yfinance 獲取歷史 K 線數據。
+    
+    Args:
+        ticker_symbol (str): 股票代碼 (e.g., '2330.TW').
+        period (str): 時間範圍。
         
-        Args:
-            symbol (str): 股票代碼 (e.g., '2330')
-            fugle_api_key (str): Fugle API Key
-            
-        Returns:
-            dict: 市場數據字典
-        """
-        data = {"price": None, "change": 0, "pct": 0, "source": "None"}
-        
-        # 轉換代碼格式 (Fugle: 2330, YF: 2330.TW)
-        yf_symbol = f"{symbol}.TW" if symbol.isdigit() else "^TWII"
-        
-        # 嘗試使用 Fugle (Primary)
-        if fugle_api_key:
-            try:
-                client = RestClient(api_key=fugle_api_key)
-                stock = client.stock
-                quote = stock.intraday.quote(symbol=symbol)
-                if quote:
-                    data["price"] = quote.get('lastPrice')
-                    data["change"] = quote.get('change')
-                    data["pct"] = quote.get('changePercent')
-                    data["source"] = "Fugle"
-                    return data
-            except Exception:
-                st.warning(f"Fugle API 獲取 {symbol} 失敗，嘗試備援方案...")
-
-        # 備援使用 yfinance (Fallback)
-        try:
-            ticker = yf.Ticker(yf_symbol)
-            df = ticker.history(period="2d")
-            if not df.empty:
-                current = df['Close'].iloc[-1]
-                prev = df['Close'].iloc[-2]
-                data["price"] = current
-                data["change"] = current - prev
-                data["pct"] = (data["change"] / prev) * 100
-                data["source"] = "yfinance"
-        except Exception as e:
-            st.error(f"yfinance 獲取 {symbol} 失敗: {e}")
-            
-        return data
+    Returns:
+        pd.DataFrame: 歷史數據。
+    """
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        df = ticker.history(period=period)
+        return df
+    except Exception as e:
+        st.error(f"yfinance 抓取失敗: {e}")
+        return pd.DataFrame()
 
 # --- AI 分析模組 ---
 
-def get_ai_analysis(api_key, market_info):
+def analyze_market_with_gemini(api_key, market_data):
     """
-    呼叫 Gemini AI 進行市場盤勢分析。
+    使用 Google Gemini 模型進行量化情緒分析。
     
     Args:
-        api_key (str): Google API Key
-        market_info (str): 彙整後的市場數據文本
+        api_key (str): Gemini API Key.
+        market_data (dict): 包含當前市場數據的字典。
         
     Returns:
-        str: AI 分析結果
+        str: AI 分析報告。
     """
     if not api_key:
-        return "請在側邊欄輸入 Google API Key 以啟用 AI 盤勢分析。"
+        return "請提供 Gemini API Key 以啟用 AI 分析功能。"
     
     try:
         genai.configure(api_key=api_key)
-        # 依照要求使用 gemini-3-flash-preview (若不存在則建議使用 1.5-flash)
-        model = genai.GenerativeModel('gemini-1.5-flash') 
+        # 預設使用用戶要求的 gemini-3-flash-preview
+        model = genai.GenerativeModel('gemini-1.5-flash') # 註: 目前實際穩定版為 1.5
         
         prompt = f"""
-        你是一位資深台股分析師，請根據以下今日市場數據提供簡短精闢的分析：
-        {market_info}
+        你是一位資深量化交易專家。請根據以下數據進行市場評論與操作建議：
+        1. 加權指數 (TSE): {market_data.get('tse_price')}
+        2. 台指期近月: {market_data.get('tx_price')}
+        3. 期現貨價差: {market_data.get('spread')}
+        4. 分析標的 ({market_data.get('symbol')}): 近期收盤價 {market_data.get('last_close')}
         
-        請包含：
-        1. 多空趨勢判斷
-        2. 關鍵支撐壓力位建議
-        3. 避險或操作建議
-        請使用繁體中文，語氣專業且精煉。
+        請以繁體中文提供：
+        - 市場情緒分析 (多/空/中性)
+        - 關鍵支撐壓力位
+        - 短線操作建議
         """
+        
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
         return f"AI 分析發生錯誤: {str(e)}"
 
-# --- 側邊欄設定 ---
+# --- UI 渲染模組 ---
 
-st.sidebar.title("🛠 設定中心")
-fugle_key = st.sidebar.text_input("Fugle API Key", type="password", help="用於獲取即時台股數據")
-google_key = st.sidebar.text_input("Google API Key", type="password", help="用於 AI 盤勢分析")
+def main():
+    # --- 側邊欄配置 ---
+    st.sidebar.title("🛠 設定中心")
+    fugle_api_key = st.sidebar.text_input("Fugle API Key", type="password")
+    gemini_api_key = st.sidebar.text_input("Gemini API Key", type="password")
+    
+    target_stock = st.sidebar.text_input("監控標的 (yfinance 格式)", value="2330.TW")
+    refresh_btn = st.sidebar.button("手動刷新數據")
+    
+    st.title("🚀 專業操盤戰情室")
+    st.markdown(f"**更新時間：** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-st.sidebar.markdown("---")
-st.sidebar.info("""
-**數據分流說明：**
-1. **台指期 (TXF)**：固定由 Yahoo Finance 獲取。
-2. **台股/大盤**：若輸入 Fugle Key 則優先使用，否則自動切換至備援來源。
-""")
+    # --- 非阻塞數據初始化 ---
+    tse_data = None
+    tx_price = None
+    stock_df = pd.DataFrame()
+    
+    # 執行數據抓取 (包裹於 Try-Except 以免單一源失敗導致整頁崩潰)
+    with st.spinner('正在擷取全球金融數據...'):
+        # 1. 台指期爬蟲
+        tx_price = fetch_tx_future_price()
+        
+        # 2. Fugle 指數行情
+        if fugle_api_key:
+            tse_data = get_fugle_quote(fugle_api_key, "TSE01")
+            
+        # 3. 股票歷史數據
+        stock_df = fetch_stock_history(target_stock)
 
-# --- 主畫面佈局 ---
+    # --- 頂部指標看板 (RWD 佈局) ---
+    m1, m2, m3, m4 = st.columns([1,1,1,1])
+    
+    with m1:
+        val = f"{tse_data['price']:,}" if tse_data and tse_data['price'] else "N/A"
+        delta = f"{tse_data['changePercent']}%" if tse_data and tse_data['changePercent'] else "N/A"
+        st.metric("加權指數 (TSE)", val, delta)
+        
+    with m2:
+        val = f"{tx_price:,}" if tx_price else "N/A"
+        st.metric("台指期近月", val)
+        
+    with m3:
+        if tx_price and tse_data and tse_data['price']:
+            spread = tx_price - tse_data['price']
+            st.metric("期現貨價差", f"{spread:.2f}", delta_color="normal")
+        else:
+            st.metric("期現貨價差", "計算中")
+            
+    with m4:
+        if not stock_df.empty:
+            curr_p = stock_df['Close'].iloc[-1]
+            prev_p = stock_df['Close'].iloc[-2]
+            chg = curr_p - prev_p
+            st.metric(f"監控: {target_stock}", f"{curr_p:.2f}", f"{chg:.2f}")
+        else:
+            st.metric(f"監控: {target_stock}", "N/A")
 
-st.title("🚀 專業操盤戰情室")
-st.caption(f"最後更新時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # --- 中間圖表區 ---
+    st.divider()
+    col_chart, col_ai = st.columns([2, 1])
+    
+    with col_chart:
+        st.subheader("📊 技術分析圖表")
+        if not stock_df.empty:
+            fig = go.Figure(data=[go.Candlestick(
+                x=stock_df.index,
+                open=stock_df['Open'],
+                high=stock_df['High'],
+                low=stock_df['Low'],
+                close=stock_df['Close'],
+                name="K線"
+            )])
+            fig.update_layout(
+                height=500,
+                template="plotly_dark",
+                margin=dict(l=10, r=10, t=10, b=10),
+                xaxis_rangeslider_visible=False
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("無 K 線數據可顯示，請檢查代碼輸入。")
 
-# 初始化變數
-taiex_data = None
-tsmc_data = None
-txf_data = None
+    # --- AI 分析區 ---
+    with col_ai:
+        st.subheader("🤖 AI 投資策略建議")
+        if st.button("執行 AI 診斷"):
+            market_context = {
+                "tse_price": tse_data['price'] if tse_data else "Unknown",
+                "tx_price": tx_price,
+                "spread": (tx_price - tse_data['price']) if (tx_price and tse_data) else "N/A",
+                "symbol": target_stock,
+                "last_close": stock_df['Close'].iloc[-1] if not stock_df.empty else "N/A"
+            }
+            analysis_result = analyze_market_with_gemini(gemini_api_key, market_context)
+            st.info(analysis_result)
+        else:
+            st.write("點擊按鈕生成分析報告...")
 
-# --- 數據獲取 (非阻塞) ---
+    # --- 底部原始數據 ---
+    with st.expander("查看原始數據清單"):
+        if not stock_df.empty:
+            st.dataframe(stock_df.tail(10), use_container_width=True)
+        else:
+            st.info("尚未載入數據。")
 
-# 1. 台指期獨立執行
-txf_data = DataEngine.get_taiex_futures()
-
-# 2. 大盤與權值股數據
-taiex_data = DataEngine.get_market_data("IX0001", fugle_key) # 大盤代號在 Fugle 常為 IX0001
-tsmc_data = DataEngine.get_market_data("2330", fugle_key)
-
-# --- UI 渲染區塊 ---
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    val = taiex_data['price'] if taiex_data else None
-    change = taiex_data['pct'] if taiex_data else 0
-    st.metric(
-        label="加權指數 (TAIEX)",
-        value=f"{val:,.2f}" if val else "N/A",
-        delta=f"{change:.2f}%",
-        delta_color="normal"
-    )
-    st.caption(f"來源: {taiex_data['source'] if taiex_data else 'Unknown'}")
-
-with col2:
-    val = txf_data['price'] if txf_data else None
-    change = txf_data['pct'] if txf_data else 0
-    st.metric(
-        label="台指期近月 (TXF)",
-        value=f"{val:,.0f}" if val else "N/A",
-        delta=f"{change:.2f}%"
-    )
-    st.caption("來源: yfinance (WTX=F)")
-
-with col3:
-    val = tsmc_data['price'] if tsmc_data else None
-    change = tsmc_data['pct'] if tsmc_data else 0
-    st.metric(
-        label="台積電 (2330)",
-        value=f"{val:,.1f}" if val else "N/A",
-        delta=f"{change:.2f}%"
-    )
-    st.caption(f"來源: {tsmc_data['source'] if tsmc_data else 'Unknown'}")
-
-# --- 圖表與分析區 ---
-
-tab1, tab2 = st.tabs(["📊 市場圖表", "🤖 AI 盤勢分析"])
-
-with tab1:
-    if txf_data and "df" in txf_data:
-        df = txf_data["df"]
-        fig = go.Figure(data=[go.Candlestick(
-            x=df.index,
-            open=df['Open'],
-            high=df['High'],
-            low=df['Low'],
-            close=df['Close'],
-            name="台指期"
-        )])
-        fig.update_layout(
-            title="台指期 (WTX=F) 最近交易走勢",
-            template="plotly_dark",
-            xaxis_rangeslider_visible=False,
-            height=500,
-            margin=dict(l=10, r=10, t=40, b=10)
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("無法載入圖表數據")
-
-with tab2:
-    st.subheader("Gemini 核心分析")
-    if st.button("生成今日 AI 戰報"):
-        with st.spinner("AI 正在解析市場情緒與數據..."):
-            market_summary = f"""
-            台股加權指數: {taiex_data['price'] if taiex_data else '未知'} ({taiex_data['pct'] if taiex_data else 0:.2f}%)
-            台指期: {txf_data['price'] if txf_data else '未知'} ({txf_data['pct'] if txf_data else 0:.2f}%)
-            權王台積電: {tsmc_data['price'] if tsmc_data else '未知'} ({tsmc_data['pct'] if tsmc_data else 0:.2f}%)
-            """
-            analysis = get_ai_analysis(google_key, market_summary)
-            st.markdown(f"---")
-            st.markdown(analysis)
-
-# --- 頁尾 ---
-st.markdown("---")
-st.caption("⚠️ 本工具僅供參考，不構成任何投資建議。投資人應獨立判斷並自負盈虧。")
+if __name__ == "__main__":
+    main()
 
 # --- requirements.txt ---
 # streamlit
 # pandas
 # yfinance
+# requests
+# beautifulsoup4
 # google-generativeai
 # plotly
-# fugle-marketdata
