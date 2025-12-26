@@ -12,3 +12,4 @@ plotly
 lxml
 html5lib
 pandas-datareader
+pandas_ta
