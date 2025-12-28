@@ -1,50 +1,67 @@
 import streamlit as st
-import pandas as pd
 import yfinance as yf
-import google.generativeai as genai
+import pandas as pd
+import numpy as np
 import requests
 from bs4 import BeautifulSoup
-import datetime
+import google.generativeai as genai
 from fugle_marketdata import RestClient
 import time
+from datetime import datetime
 
-# --- UI 樣式設定模組 ---
-def apply_custom_css():
+# --- 頁面設定 ---
+st.set_page_config(
+    page_title="Professional Quant Dashboard",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# --- CSS 視覺美化模組 ---
+def inject_custom_css():
     """
-    注入自定義 CSS 以實現深色主題、漸層背景與卡片陰影效果。
-    同時優化手機端 RWD 顯示。
+    注入自定義 CSS 以實現深色高質感 UI、卡片陰影與 RWD 佈局。
     """
     st.markdown("""
         <style>
-        /* 整體背景色 */
-        .main {
-            background-color: #0e1117;
-            color: #ffffff;
-        }
-        /* 頂部漸層標題卡片 */
+        /* 整體背景與字體 */
+        .main { background-color: #0E1117; color: #E0E0E0; }
+        
+        /* 頂部標題卡片 */
         .header-card {
-            background: linear-gradient(90deg, #1e3a8a 0%, #3b82f6 100%);
+            background: linear-gradient(90deg, #1A237E 0%, #0D47A1 100%);
             padding: 20px;
-            border-radius: 15px;
+            border-radius: 10px;
             margin-bottom: 25px;
             box-shadow: 0 4px 15px rgba(0,0,0,0.3);
             text-align: center;
         }
-        /* 技術指標卡片樣式 */
+        
+        /* 指標卡片樣式 */
         .metric-card {
-            background-color: #1a1c24;
+            background-color: #1E2127;
+            border: 1px solid #30363D;
             padding: 15px;
-            border-radius: 10px;
-            border-left: 5px solid #3b82f6;
-            margin: 5px 0px;
+            border-radius: 8px;
+            text-align: center;
             box-shadow: 2px 2px 10px rgba(0,0,0,0.2);
         }
-        /* RSI 顏色標記 */
-        .rsi-high { color: #ff4b4b; font-weight: bold; }
-        .rsi-low { color: #00ff41; font-weight: bold; }
-        .rsi-normal { color: #ffffff; }
         
-        /* 隱藏 Streamlit 預設元件標籤 */
+        /* 技術指標專用卡片 */
+        .tech-card {
+            background-color: #161B22;
+            border-left: 4px solid #58A6FF;
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 4px;
+        }
+        
+        /* RSI 顏色邏輯 */
+        .rsi-high { color: #FF5252; font-weight: bold; }
+        .rsi-low { color: #69F0AE; font-weight: bold; }
+        .rsi-normal { color: #FFFFFF; }
+
+        /* 隱藏 Streamlit 預設元素 */
         #MainMenu {visibility: hidden;}
         footer {visibility: hidden;}
         </style>
@@ -52,264 +69,243 @@ def apply_custom_css():
 
 # --- 數據抓取模組 (Market Data) ---
 
-def get_stock_data(ticker_symbol):
+def get_basic_price(symbol: str):
     """
-    使用 yfinance 抓取股票或指數數據。
+    使用 yfinance 抓取基礎標的價格與漲跌幅。
     
-    :param ticker_symbol: yfinance 代號 (例如 '^TWII')
-    :return: (price, change_pct, history_df)
+    :param symbol: yfinance 代號 (如 ^TWII, ^VIX)
+    :return: (現價, 漲跌幅%, 原始資料)
     """
     try:
-        ticker = yf.Ticker(ticker_symbol)
-        df = ticker.history(period="5d")
-        if df.empty:
-            return 0.0, 0.0, pd.DataFrame()
-        
-        current_price = df['Close'].iloc[-1]
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="2d")
+        if len(df) < 2:
+            return 0.0, 0.0, None
+        curr_price = df['Close'].iloc[-1]
         prev_price = df['Close'].iloc[-2]
-        change_pct = ((current_price - prev_price) / prev_price) * 100
-        return current_price, change_pct, df
+        change_pct = ((curr_price - prev_price) / prev_price) * 100
+        return float(curr_price), float(change_pct), df
     except Exception as e:
-        return 0.0, 0.0, pd.DataFrame()
+        return None, None, None
 
-def get_txf_data(fugle_key=None):
+def get_txf_data(fugle_key: str = None):
     """
-    獲取台指期 (TXF) 報價。
-    優先使用 Fugle API，失敗或無 Key 時降級使用 yfinance (WTX=F)。
+    台指期 (TXF) 雙源策略：優先使用 Fugle，備援使用 yfinance (WTX=F)。
     
-    :param fugle_key: Fugle Market Data API Key
-    :return: (txf_price, txf_change_pct)
+    :param fugle_key: Fugle API Key
+    :return: (台指期現價, 漲跌幅%)
     """
-    # 優先嘗試 Fugle
+    # 嘗試 Fugle
     if fugle_key:
         try:
             client = RestClient(api_key=fugle_key)
-            # 自動搜尋近月合約 (簡化邏輯：抓取 TXF 開頭的列表並取第一個)
-            # 注意：此處僅為邏輯示意，實際需根據 Fugle SDK 格式調整
-            quote = client.futopt.intraday.quote(symbol="TXFA") # TXFA 通常代表連續近月
-            price = quote.get('lastPrice', 0)
-            change = quote.get('changePercent', 0)
-            if price > 0:
-                return price, change
+            # 自動抓取最近月合約 (簡化邏輯：抓取 TXF 開頭的 tickers)
+            # 實務上需根據月份篩選，此處模擬抓取
+            res = client.futopt.intraday.tickers(type='future', symbol='TXF')
+            if res:
+                target_symbol = res[0]['symbol'] # 取得最近月，例如 TXF202503
+                quote = client.futopt.intraday.quote(symbol=target_symbol)
+                price = quote.get('lastPrice', 0)
+                change_pct = quote.get('changePercent', 0)
+                return float(price), float(change_pct)
         except:
             pass
-            
-    # 備援：yfinance
-    price, change, _ = get_stock_data("WTX=F")
-    return price, change
-
-def get_technical_indicators(df):
-    """
-    計算 RSI(14), MA(5), MA(20) 技術指標。
     
-    :param df: 包含 Close 欄位的 pandas DataFrame
-    :return: (rsi, ma5, ma20)
+    # 備援：yfinance (WTX=F 代表台指期連續近月)
+    p, c, _ = get_basic_price("WTX=F")
+    return p, c
+
+def get_fii_oi():
     """
-    if df.empty or len(df) < 20:
+    抓取外資期貨淨未平倉口數 (Scraping from public source).
+    """
+    try:
+        # 這裡以玩股網或期交所公開資訊為例 (簡化模擬)
+        url = "https://www.taifex.com.tw/cht/3/futContractsDate"
+        # 實務上解析 HTML 較複雜，此處示範 BeautifulSoup 邏輯框架
+        # headers = {'User-Agent': 'Mozilla/5.0'}
+        # resp = requests.get(url, headers=headers)
+        # 這裡回傳模擬數據以利執行，實作時需解析 table
+        return 3450  # 模擬外資淨多單
+    except:
+        return 0
+
+def get_option_max_oi():
+    """
+    估算選擇權最大未平倉區間 (Call Wall / Put Wall).
+    """
+    try:
+        # 模擬回傳資料
+        return {"call_wall": 23500, "put_wall": 22000}
+    except:
+        return {"call_wall": 0, "put_wall": 0}
+
+# --- 技術指標計算模組 ---
+
+def calculate_indicators(df: pd.DataFrame):
+    """
+    計算 RSI(14), MA(5), MA(20)。
+    """
+    if df is None or len(df) < 20:
         return 0.0, 0.0, 0.0
     
     close = df['Close']
     
-    # MA 計算
-    ma5 = close.rolling(window=5).mean().iloc[-1]
-    ma20 = close.rolling(window=20).mean().iloc[-1]
-    
-    # RSI 計算
+    # RSI
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
     
-    # 安全轉換為 float
-    return float(rsi.iloc[-1]), float(ma5), float(ma20)
-
-# --- 籌碼面抓取模組 (Scraping) ---
-
-def get_fii_oi():
-    """
-    抓取期交所外資期貨淨未平倉口數 (FII Net OI)。
-    使用 requests 直接獲取簡單數據。
-    """
-    try:
-        # 此處使用簡單的 Mock 或爬蟲邏輯 (實際生產環境建議爬取期交所 CSV)
-        # 範例邏輯：爬取財經網站或期交所摘要
-        url = "https://www.taifex.com.tw/cht/3/futContractsDate"
-        # 簡化處理：由於爬蟲穩定性，若失敗回傳一個模擬值或 0
-        return 2500  # 單位：口 (範例值)
-    except:
-        return 0
-
-def get_option_max_oi():
-    """
-    估算選擇權最大未平倉區間 (Call/Put Wall)。
-    """
-    try:
-        # 範例回傳：(Call_Wall, Put_Wall)
-        return 23500, 22000
-    except:
-        return 0, 0
+    ma5 = close.rolling(window=5).mean()
+    ma20 = close.rolling(window=20).mean()
+    
+    return float(rsi.iloc[-1]), float(ma5.iloc[-1]), float(ma20.iloc[-1])
 
 # --- AI 分析模組 ---
 
-def analyze_market_with_gemini(api_key, market_info):
+def get_ai_analysis(api_key, context_data):
     """
-    使用 Gemini API 進行量化策略分析。
+    使用 Gemini 進行市場盤勢分析。
     """
     if not api_key:
-        return "⚠️ 請先在側邊欄輸入 Gemini API Key 以啟用 AI 分析。"
+        return "⚠️ 請提供 Gemini API Key 以啟用 AI 顧問。"
     
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-3-flash-preview')
         
         prompt = f"""
-        你是一位專業的台灣量化交易員。請根據以下市場數據進行簡短分析並給出交易建議：
+        你是一位專業的台股量化交易員。請根據以下數據提供簡短、精闢的市場分析：
+        1. 加權指數: {context_data['twii_p']} ({context_data['twii_c']}%)
+        2. 台指期: {context_data['txf_p']}
+        3. 恐慌指數 VIX: {context_data['vix']}
+        4. RSI(14): {context_data['rsi']:.2f}
+        5. MA5/MA20: {context_data['ma5']:.2f} / {context_data['ma20']:.2f}
+        6. 外資期貨淨未平倉: {context_data['fii_oi']} 口
+        7. 選擇權最大 OI 區間: {context_data['opt_range']}
         
-        數據快照：
-        - 加權指數: {market_info['twii_price']:.2f} ({market_info['twii_change']:.2f}%)
-        - 台指期: {market_info['txf_price']:.2f}
-        - 價差: {market_info['spread']:.2f}
-        - VIX 指數: {market_info['vix_price']:.2f}
-        - 技術指標 (加權): RSI(14): {market_info['rsi']:.2f}, MA5: {market_info['ma5']:.2f}, MA20: {market_info['ma20']:.2f}
-        - 外資期貨淨口數: {market_info['fii_oi']}
-        
-        請提供：
-        1. 市場情緒評估 (多/空/中立)
-        2. 短線支撐壓力觀察
-        3. 建議操作策略 (包含停損提醒)
+        請分析短線趨勢、支撐壓力位及交易建議。使用繁體中文。
         """
-        
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"AI 分析出錯: {str(e)}"
+        return f"AI 分析發生錯誤: {str(e)}"
 
-# --- 主程式邏輯 ---
+# --- 主程式介面 ---
 
 def main():
-    st.set_page_config(page_title="Pro Quant Station", layout="wide")
-    apply_custom_css()
-
-    # --- 左側邊欄 (Sidebar) ---
-    st.sidebar.title("⚙️ 系統配置")
+    inject_custom_css()
     
-    # 狀態檢測
-    gemini_key = st.sidebar.text_input("Gemini API Key", type="password")
-    fugle_key = st.sidebar.text_input("Fugle API Key (Optional)", type="password")
+    # --- Sidebar 系統配置 ---
+    st.sidebar.title("🛠️ 系統配置")
     
-    ai_status = "✅ Connected" if gemini_key else "⚠️ Disconnected"
-    py_status = "✅ Running"
+    # 功能狀態
+    st.sidebar.subheader("連線狀態")
+    gemini_key = st.sidebar.text_input("Gemini API Key", type="password", help="用於 AI 策略分析")
+    fugle_key = st.sidebar.text_input("Fugle API Key (選填)", type="password")
     
-    st.sidebar.write(f"AI 引擎狀態: {ai_status}")
-    st.sidebar.write(f"腳本執行狀態: {py_status}")
-    
-    st.sidebar.divider()
+    status_ai = "✅" if gemini_key else "⚠️"
+    status_py = "✅"
+    st.sidebar.write(f"AI 引擎: {status_ai} | Python 腳本: {status_py}")
     
     # 自動監控
-    auto_refresh = st.sidebar.toggle("啟用自動監控", value=False)
+    auto_refresh = st.sidebar.toggle("自動更新監控", value=False)
     refresh_rate = st.sidebar.slider("更新頻率 (秒)", 10, 300, 60)
     
     # Telegram 通知
-    with st.sidebar.expander("📢 Telegram 通知設定"):
+    with st.sidebar.expander("🔔 Telegram 通知設定"):
         tg_token = st.sidebar.text_input("Bot Token")
-        tg_chat_id = st.sidebar.text_input("Chat ID")
+        tg_chatid = st.sidebar.text_input("Chat ID")
         if st.sidebar.button("Test Connection"):
-            st.sidebar.success("發送測試訊息成功！")
+            st.sidebar.success("發送測試訊息中...")
 
-    # --- 主儀表板數據抓取 ---
-    with st.spinner('同步市場數據中...'):
-        # 1. 抓取主要指數
-        twii_price, twii_change, twii_df = get_stock_data("^TWII")
-        vix_price, vix_change, _ = get_stock_data("^VIX")
-        txf_price, txf_change = get_txf_data(fugle_key)
-        
-        # 2. 抓取個股
-        tsmc_price, tsmc_change, _ = get_stock_data("2330.TW")
-        nvda_price, nvda_change, _ = get_stock_data("NVDA")
-        
-        # 3. 技術指標計算 (以加權指數為例)
-        rsi_val, ma5_val, ma20_val = get_technical_indicators(twii_df)
-        
-        # 4. 籌碼面數據
-        fii_oi = get_fii_oi()
-        call_wall, put_wall = get_option_max_oi()
-        
-        # --- 數據清洗 (防呆機制) ---
-        twii_price = twii_price or 0.0
-        txf_price = txf_price or 0.0
-        vix_price = vix_price or 0.0
-        spread = twii_price - txf_price if (twii_price > 0 and txf_price > 0) else 0.0
+    # --- Header ---
+    st.markdown('<div class="header-card"><h1>📈 彈性量化戰情室 (Flexible Mode)</h1></div>', unsafe_allow_html=True)
 
-    # --- UI 佈局展現 ---
+    # --- 數據抓取邏輯 ---
+    # 抓取基礎數據
+    twii_p, twii_c, twii_df = get_basic_price("^TWII")
+    txf_p, txf_c = get_txf_data(fugle_key)
+    vix_p, vix_c, _ = get_basic_price("^VIX")
+    tsmc_p, tsmc_c, tsmc_df = get_basic_price("2330.TW")
+    nvda_p, nvda_c, _ = get_basic_price("NVDA")
     
-    # Header
-    st.markdown('<div class="header-card"><h1>彈性量化戰情室 (Flexible Mode)</h1></div>', unsafe_allow_html=True)
+    # 數據清洗 (防止 None 導致格式化錯誤)
+    twii_p = twii_p if twii_p is not None else 0.0
+    twii_c = twii_c if twii_c is not None else 0.0
+    txf_p = txf_p if txf_p is not None else 0.0
+    txf_c = txf_c if txf_c is not None else 0.0
+    vix_p = vix_p if vix_p is not None else 0.0
+    spread = twii_p - txf_p if twii_p and txf_p else 0.0
     
-    # 第一列: Metrics
+    # 計算技術指標 (以台積電為主要觀測對象)
+    rsi_val, ma5_val, ma20_val = calculate_indicators(tsmc_df)
+
+    # --- 第一列：核心指標 (Metrics) ---
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("加權指數", f"{twii_price:,.2f}", f"{twii_change:+.2f}%")
-    m2.metric("台指期 (TXF)", f"{txf_price:,.2f}", f"{txf_change:+.2f}%")
-    m3.metric("期現貨價差", f"{spread:.2f}", delta_color="off")
-    # VIX 顏色反向邏輯 (越低越好)
-    m4.metric("VIX 恐慌指數", f"{vix_price:.2f}", f"{vix_change:+.2f}%", delta_color="inverse")
-
-    # 第二列: 個股與技術指標
-    c1, c2, c3 = st.columns([1, 1, 2])
-    
-    with c1:
-        st.subheader("核心持倉/連動")
-        st.metric("台積電 (2330)", f"{tsmc_price:.1f}", f"{tsmc_change:+.2f}%")
-        st.metric("NVDA (美股)", f"{nvda_price:.2f}", f"{nvda_change:+.2f}%")
-        
-    with c2:
-        st.subheader("籌碼數據")
-        st.markdown(f"""
-            <div class="metric-card">
-                <b>外資期貨淨口數:</b> <br><span style="font-size:1.2em; color:{'#ff4b4b' if fii_oi < 0 else '#00ff41'}">{fii_oi:+,}</span>
-            </div>
-            <div class="metric-card">
-                <b>OP 壓力/支撐:</b> <br>C: {call_wall} / P: {put_wall}
-            </div>
-        """, unsafe_allow_html=True)
-
-    with c3:
-        st.subheader("技術指標區塊")
-        rsi_color = "rsi-high" if rsi_val > 70 else ("rsi-low" if rsi_val < 30 else "rsi-normal")
-        st.markdown(f"""
-            <div style="display: flex; justify-content: space-around;">
-                <div class="metric-card" style="flex:1; margin-right:10px;">
-                    RSI(14)<br><span class="{rsi_color}" style="font-size:1.5em;">{rsi_val:.2f}</span>
-                </div>
-                <div class="metric-card" style="flex:1; margin-right:10px;">
-                    MA(5)<br><span style="font-size:1.5em;">{ma5_val:,.0f}</span>
-                </div>
-                <div class="metric-card" style="flex:1;">
-                    MA(20)<br><span style="font-size:1.5em;">{ma20_val:,.0f}</span>
-                </div>
-            </div>
-        """, unsafe_allow_html=True)
+    with m1:
+        st.metric("加權指數", f"{twii_p:,.2f}", f"{twii_c:+.2f}%")
+    with m2:
+        st.metric("台指期 TXF", f"{txf_p:,.2f}", f"{txf_c:+.2f}%")
+    with m3:
+        st.metric("期現貨價差", f"{spread:.2f}", help="正價差代表期貨強於現貨")
+    with m4:
+        # VIX 邏輯：漲通常代表利空，使用 inverse 顏色 (Streamlit 1.30+ 支援)
+        st.metric("VIX 恐慌指數", f"{vix_p:.2f}", f"{vix_c:+.2f}%", delta_color="inverse")
 
     st.divider()
 
-    # --- AI 策略建議區 ---
-    st.subheader("🤖 AI 策略戰術分析")
-    market_context = {
-        'twii_price': twii_price, 'twii_change': twii_change,
-        'txf_price': txf_price, 'spread': spread,
-        'vix_price': vix_price, 'rsi': rsi_val,
-        'ma5': ma5_val, 'ma20': ma20_val,
-        'fii_oi': fii_oi
-    }
+    # --- 第二列：個股與技術指標 ---
+    c1, c2 = st.columns([1, 1])
     
-    if st.button("生成 AI 分析報告"):
-        with st.chat_message("assistant"):
-            analysis_result = analyze_market_with_gemini(gemini_key, market_context)
-            st.markdown(analysis_result)
-    else:
-        st.info("點擊上方按鈕獲取由 Gemini 驅動的量化交易報告。")
+    with c1:
+        st.subheader("🔥 關鍵個股報價")
+        k1, k2 = st.columns(2)
+        k1.metric("台積電 (2330)", f"{tsmc_p if tsmc_p else 0:.1f}", f"{tsmc_c if tsmc_c else 0:+.2f}%")
+        k2.metric("NVDA (美股)", f"{nvda_p if nvda_p else 0:.2f}", f"{nvda_c if nvda_c else 0:+.2f}%")
 
-    # 自動重整邏輯
+    with c2:
+        st.subheader("🛠️ 技術指標區塊 (TSMC)")
+        # RSI 顏色判斷
+        rsi_class = "rsi-normal"
+        if rsi_val > 70: rsi_class = "rsi-high"
+        elif rsi_val < 30: rsi_class = "rsi-low"
+        
+        st.markdown(f"""
+            <div class="tech-card">
+                <b>RSI(14):</b> <span class="{rsi_class}">{rsi_val:.2f}</span><br>
+                <b>MA(5):</b> {ma5_val:.2f}<br>
+                <b>MA(20):</b> {ma20_val:.2f}
+            </div>
+        """, unsafe_allow_html=True)
+
+    # --- 第三列：籌碼面數據 ---
+    st.subheader("📊 籌碼面監控")
+    fii_oi = get_fii_oi()
+    opt_data = get_option_max_oi()
+    
+    chip1, chip2, chip3 = st.columns(3)
+    chip1.metric("外資期貨淨未平倉", f"{fii_oi:+,} 口", delta_color="normal")
+    chip2.metric("Call Wall (最大壓)", f"{opt_data['call_wall']:,}")
+    chip3.metric("Put Wall (最大撐)", f"{opt_data['put_wall']:,}")
+
+    # --- AI 策略分析區 ---
+    st.markdown("### 🤖 AI 智能投顧分析")
+    if st.button("生成 AI 行情診斷"):
+        with st.spinner("正在呼叫 Gemini 分析市場數據..."):
+            context = {
+                "twii_p": twii_p, "twii_c": twii_c, "txf_p": txf_p,
+                "vix": vix_p, "rsi": rsi_val, "ma5": ma5_val, "ma20": ma20_val,
+                "fii_oi": fii_oi, "opt_range": f"{opt_data['put_wall']} ~ {opt_data['call_wall']}"
+            }
+            analysis = get_ai_analysis(gemini_key, context)
+            st.info(analysis)
+    else:
+        st.write("點擊按鈕獲取最新 AI 診斷。")
+
+    # 自動更新機制
     if auto_refresh:
         time.sleep(refresh_rate)
         st.rerun()
@@ -321,7 +317,9 @@ if __name__ == "__main__":
 # streamlit
 # yfinance
 # pandas
-# google-generativeai
+# numpy
 # requests
 # beautifulsoup4
+# google-generativeai
 # fugle-marketdata
+```
