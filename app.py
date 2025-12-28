@@ -322,4 +322,3 @@ if __name__ == "__main__":
 # beautifulsoup4
 # google-generativeai
 # fugle-marketdata
-```
